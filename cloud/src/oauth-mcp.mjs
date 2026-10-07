@@ -1,3 +1,4 @@
+import { executionIdentitySchema, agentProfile } from "../../shared/execution-identity.mjs";
 const enc = new TextEncoder();
 const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(value), {
   status,
@@ -142,11 +143,13 @@ export async function routeOAuth(request, env, url) {
 const oauthSecurity = [{ type: "oauth2", scopes: ["taskboard:read", "taskboard:write"] }];
 const objectOutput = { type: "object", additionalProperties: true };
 export const toolDefs = [
+  { name: "whoami", title: "Confirm Hermes connection identity", description: "Call first on entering Hermes. Returns authenticated connection actor and endpoint environment; does not infer the model.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, outputSchema: objectOutput, securitySchemes: oauthSecurity, annotations: { readOnlyHint: true } },
+  { name: "register_agent", title: "Register agent and write identity Markdown", description: "After whoami, record your actual client model/session and work scope for this task. Saves a Markdown attachment and comment. Use the returned executionIdentity on subsequent add_comment calls. Omit unknown model; never guess.", inputSchema: { type: "object", properties: { id: { type: "string" }, executionIdentity: executionIdentitySchema }, required: ["id", "executionIdentity"], additionalProperties: false }, outputSchema: objectOutput, securitySchemes: oauthSecurity, annotations: { readOnlyHint: false, destructiveHint: false } },
   { name: "search", title: "Search Taskboard", description: "Use this when the user wants to find Hermes Taskboard projects or issues.", inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"], additionalProperties: false }, outputSchema: { type: "object", properties: { results: { type: "array", items: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" }, text: { type: "string" } }, required: ["id", "title", "url"], additionalProperties: false } } }, required: ["results"], additionalProperties: false }, securitySchemes: oauthSecurity, _meta: { securitySchemes: oauthSecurity }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: "fetch", title: "Fetch Taskboard issue", description: "Use this when the user wants to read one Hermes Taskboard issue and its comments by ID or identifier.", inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false }, outputSchema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, text: { type: "string" }, url: { type: "string" } }, required: ["id", "title", "text", "url"], additionalProperties: false }, securitySchemes: oauthSecurity, _meta: { securitySchemes: oauthSecurity }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: "create_issue", title: "Create Taskboard issue", description: "Use this when the user wants to create an issue in a specific Hermes Taskboard project.", inputSchema: { type: "object", properties: { projectId: { type: "string" }, title: { type: "string" }, description: { type: "string" }, status: { type: "string" }, priority: { type: "string" } }, required: ["projectId", "title"], additionalProperties: false }, outputSchema: objectOutput, securitySchemes: oauthSecurity, _meta: { securitySchemes: oauthSecurity }, annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false } },
   { name: "update_issue", title: "Update Taskboard issue", description: "Use this when the user wants to update an existing Hermes Taskboard issue after its current version is known.", inputSchema: { type: "object", properties: { id: { type: "string" }, version: { type: "integer" }, title: { type: "string" }, description: { type: "string" }, status: { type: "string" }, priority: { type: "string" } }, required: ["id", "version"], additionalProperties: false }, outputSchema: objectOutput, securitySchemes: oauthSecurity, _meta: { securitySchemes: oauthSecurity }, annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false } },
-  { name: "add_comment", title: "Add Taskboard comment", description: "Use this when the user wants to add a comment to an existing Hermes Taskboard issue.", inputSchema: { type: "object", properties: { id: { type: "string" }, body: { type: "string" } }, required: ["id", "body"], additionalProperties: false }, outputSchema: objectOutput, securitySchemes: oauthSecurity, _meta: { securitySchemes: oauthSecurity }, annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false } },
+  { name: "add_comment", title: "Add Taskboard comment", description: "Use this when the user wants to add a comment to an existing Hermes Taskboard issue.", inputSchema: { type: "object", properties: { id: { type: "string" }, body: { type: "string" }, executionIdentity: executionIdentitySchema }, required: ["id", "body"], additionalProperties: false }, outputSchema: objectOutput, securitySchemes: oauthSecurity, _meta: { securitySchemes: oauthSecurity }, annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false } },
   { name: "list_projects", title: "List projects", description: "List Hermes Taskboard projects.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, outputSchema: objectOutput, securitySchemes: oauthSecurity, _meta: { securitySchemes: oauthSecurity }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: "list_issues", title: "List issues", description: "List issues, optionally filtered by project, status, or archive state.", inputSchema: { type: "object", properties: { projectId: { type: "string" }, status: { type: "string" }, archived: { type: "string" } }, additionalProperties: false }, outputSchema: objectOutput, securitySchemes: oauthSecurity, _meta: { securitySchemes: oauthSecurity }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: "move_issue", title: "Move issue status", description: "Move an issue to another status. Requires the current version.", inputSchema: { type: "object", properties: { id: { type: "string" }, version: { type: "integer" }, status: { type: "string" } }, required: ["id", "version", "status"], additionalProperties: false }, outputSchema: objectOutput, securitySchemes: oauthSecurity, _meta: { securitySchemes: oauthSecurity }, annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false } },
@@ -168,7 +171,7 @@ export const toolDefs = [
 ];
 
 const WRITE_TOOLS = new Set([
-  "create_issue", "update_issue", "add_comment", "move_issue", "archive_issue", "restore_issue",
+  "register_agent", "create_issue", "update_issue", "add_comment", "move_issue", "archive_issue", "restore_issue",
   "update_comment", "delete_comment", "add_attachment", "delete_attachment", "set_project_readme",
   "add_relation", "remove_relation", "resolve_conflict",
 ]);
@@ -192,6 +195,16 @@ function requireToolScope(token, name) {
 async function callTool(name, args, ctx) {
   const { env, actor, origin, routeApi, token } = ctx;
   requireToolScope(token, name);
+  if (name === "whoami") return { actor: { type: actor.type, id: actor.id, name: actor.name }, environment: "cloud", model: null, modelVerification: "not_provided" };
+  if (name === "register_agent") {
+    const profile = agentProfile(actor, args.executionIdentity, "cloud");
+    const commentResult = await apiJson(routeApi, env, actor, origin, `/api/tasks/${encodeURIComponent(args.id)}/comments`, "POST", { body: profile.markdown, executionIdentity: profile.executionIdentity });
+    const request = new Request(`${origin}/api/tasks/${encodeURIComponent(args.id)}/attachments`, { method: "POST", headers: { "content-type": "text/markdown; charset=utf-8", "x-taskboard-filename": encodeURIComponent(profile.filename), "x-taskboard-attachment-kind": "attachment" }, body: profile.markdown });
+    const response = await routeApi(request, env, actor, new URL(request.url));
+    const result = await response.json();
+    if (!response.ok) throw new Error(`Identity comment saved (${commentResult.comment.id}), Markdown attachment failed: ${result.error?.message ?? response.status}`);
+    return { ...profile, comment: commentResult.comment, attachment: result.attachment };
+  }
   if (name === "search") {
     const q = `%${String(args.query).slice(0, 200)}%`;
     const rows = await env.DB.prepare(`SELECT t.id, t.identifier, t.title, t.status, t.priority, t.project_id AS projectId, p.name AS projectName
@@ -209,7 +222,7 @@ async function callTool(name, args, ctx) {
   }
   if (name === "create_issue") return apiJson(routeApi, env, actor, origin, "/api/tasks", "POST", { description: "", status: "backlog", priority: "none", labels: [], ...args });
   if (name === "update_issue") { const { id, ...patch } = args; return apiJson(routeApi, env, actor, origin, `/api/tasks/${encodeURIComponent(id)}`, "PATCH", patch); }
-  if (name === "add_comment") return apiJson(routeApi, env, actor, origin, `/api/tasks/${encodeURIComponent(args.id)}/comments`, "POST", { body: args.body });
+  if (name === "add_comment") return apiJson(routeApi, env, actor, origin, `/api/tasks/${encodeURIComponent(args.id)}/comments`, "POST", { body: args.body, executionIdentity: args.executionIdentity });
   if (name === "list_projects") return apiJson(routeApi, env, actor, origin, "/api/projects");
   if (name === "list_issues") {
     const search = new URLSearchParams();
@@ -304,7 +317,7 @@ export async function routeMcp(request, env, url, routeApi) {
   else if (rpc.method === "tools/list") result = { tools: toolDefs };
   else if (rpc.method === "tools/call") {
     try {
-      const output = await callTool(rpc.params?.name, rpc.params?.arguments ?? {}, { env, origin: url.origin, routeApi, token, actor: { type: "agent", id: `oauth:${token.client_id}`, name: `Online GPT (${token.username})`, avatarUrl: null, username: token.username } });
+      const output = await callTool(rpc.params?.name, rpc.params?.arguments ?? {}, { env, origin: url.origin, routeApi, token, actor: { type: "agent", id: `oauth:${token.client_id}`, name: `MCP Agent (${token.username})`, avatarUrl: null, username: token.username } });
       result = { content: [{ type: "text", text: JSON.stringify(output, null, 2) }], structuredContent: output };
     } catch (error) { result = { isError: true, content: [{ type: "text", text: error.message }] }; }
   } else return json({ jsonrpc: "2.0", id: rpc.id ?? null, error: { code: -32601, message: "Method not found" } });

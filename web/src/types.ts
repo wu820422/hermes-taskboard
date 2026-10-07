@@ -414,6 +414,7 @@ export interface Task {
   legacyLocalThreadId: string | null;
   conversationRefs: TaskConversationRef[];
   participants: ActorIdentity[];
+  executions?: TaskExecution[];
   previewImage: Attachment | null;
   activityKey: string;
   activityUpdatedAt: string;
@@ -449,6 +450,7 @@ export interface JiraConnection {
 }
 
 export interface Comment {
+  executionIdentity?: ExecutionIdentity | null;
   id: string;
   taskId: string;
   body: string;
@@ -552,3 +554,9 @@ export interface TaskEvent {
   project?: Project;
   at: string;
 }
+
+export interface ExecutionIdentity {
+  agent: string; model?: string; environment: "local" | "cloud" | "unknown";
+  sessionId: string; scope?: string; state: "working" | "waiting" | "completed" | "blocked";
+}
+export interface TaskExecution extends ExecutionIdentity { actorId: string; commentId: string; observedAt: string; }

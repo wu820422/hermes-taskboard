@@ -575,6 +575,12 @@ export function TaskCard({
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
             />
           )}
+          {(task.executions ?? []).map((run) => (
+            <span className="execution-badge" key={`${run.actorId}:${run.agent}:${run.environment}:${run.sessionId}`}
+              title={`${run.scope || "工作範圍未提供"} · ${run.sessionId} · 最近回報 ${run.observedAt}`}>
+              {run.agent} · {run.model || "模型未提供"} · {run.environment === "local" ? "本機" : run.environment === "cloud" ? "雲端" : "來源未提供"}
+            </span>
+          ))}
           {!processingCard && showsConversation && <span className="card-properties-spacer" aria-hidden="true" />}
           {!processingCard && showsConversation && (
             <TaskConversationMenu

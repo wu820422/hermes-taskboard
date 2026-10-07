@@ -102,6 +102,7 @@ const COMMAND_OPTIONS = new Map([
   ["comment add", new Set([
     "body",
     "body-file",
+    "agent", "model", "environment", "session-id", "scope", "state",
     "thread-id",
     "binding-thread-id",
     "binding-codex-project-id",
@@ -139,6 +140,7 @@ Commands:
   issue list|get|create|update|move|archive|restore|tree|relation
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
+    [--agent NAME --model MODEL --environment local|cloud|unknown --session-id ID --scope TEXT --state working|waiting|completed|blocked]
   comment update COMMENT_ID --body TEXT --if-version N [--thread-id ID]
   comment delete COMMENT_ID --if-version N [--thread-id ID]
   attachment list (--task ISSUE_ID | --comment COMMENT_ID) [--after CURSOR]
@@ -465,8 +467,15 @@ async function execute(parsed, overrides) {
           });
         }
       }
+      const agent = parsed.options.agent ?? process.env.HERMES_AGENT_NAME;
+      const executionIdentity = agent ? {
+        agent, model: parsed.options.model ?? process.env.HERMES_AGENT_MODEL,
+        environment: parsed.options.environment ?? process.env.HERMES_EXECUTION_ENVIRONMENT ?? "unknown",
+        sessionId: parsed.options["session-id"] ?? resolveThreadId(parsed.options, overrides),
+        scope: parsed.options.scope, state: parsed.options.state ?? "working",
+      } : undefined;
       return api.request("POST", `${taskPath(parsed.operands[0])}/comments`, {
-        body,
+        body, executionIdentity,
         threadId: resolveThreadId(parsed.options, overrides),
         ...optionalField("threadBinding", threadBindingFromOptions(parsed.options)),
       });

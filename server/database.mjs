@@ -1,3 +1,4 @@
+import { executionFromRow, executionsFromComments } from "../shared/execution-identity.mjs";
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
@@ -171,6 +172,7 @@ function attachTaskActivity(task, comments, activities, previewImage = null) {
 
   task.conversationRefs = conversationRefs;
   task.participants = participants;
+  task.executions = executionsFromComments(orderedComments);
   task.previewImage = previewImage;
   task.activityKey = JSON.stringify({
     version: 1,
@@ -333,6 +335,7 @@ function commentFromRow(row) {
     authorId: row.author_id,
     authorName: row.author_name,
     authorAvatarUrl: row.author_avatar_url,
+    executionIdentity: executionFromRow(row),
     attachments: [],
     version: row.version,
     createdAt: row.created_at,
@@ -947,6 +950,9 @@ export class TaskboardDatabase {
     }
 
     const commentColumns = this.database.prepare("PRAGMA table_info(comments)").all();
+    if (!commentColumns.some((column) => column.name === "execution_identity")) {
+      this.database.exec("ALTER TABLE comments ADD COLUMN execution_identity TEXT");
+    }
     if (!commentColumns.some((column) => column.name === "thread_id")) {
       this.database.exec("ALTER TABLE comments ADD COLUMN thread_id TEXT");
     }
@@ -2929,9 +2935,9 @@ export class TaskboardDatabase {
         INSERT INTO comments (
           id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
-          author_type, author_id, author_name, author_avatar_url,
+          author_type, author_id, author_name, author_avatar_url, execution_identity,
           version, created_at, updated_at, change_revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
       `).run(
         id,
         task.id,
@@ -2941,6 +2947,7 @@ export class TaskboardDatabase {
         input.actor.id,
         input.actor.name,
         input.actor.avatarUrl,
+        input.executionIdentity ? JSON.stringify(input.executionIdentity) : null,
         timestamp,
         timestamp,
         changeRevision,
@@ -3148,7 +3155,7 @@ export class TaskboardDatabase {
           thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           author_type, author_id, author_name,
-          author_avatar_url, version, updated_at
+          author_avatar_url, execution_identity, created_at, version, updated_at
         FROM comments
         WHERE task_id IN (${placeholders})
         ORDER BY task_id, id

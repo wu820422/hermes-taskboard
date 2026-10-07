@@ -1,3 +1,4 @@
+import { parseExecutionIdentity } from "../shared/execution-identity.mjs";
 import { createHmac, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
@@ -774,8 +775,12 @@ function parseIssueRelationType(value) {
 
 function parseCommentCreate(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["body", "threadId", "threadBinding"]));
+  assertAllowedKeys(body, new Set(["body", "threadId", "threadBinding", "executionIdentity"]));
+  let executionIdentity;
+  try { executionIdentity = parseExecutionIdentity(body.executionIdentity); }
+  catch (error) { throw new ApiError(400, "INVALID_EXECUTION_IDENTITY", error.message); }
   return {
+    executionIdentity,
     body: stringField(body.body ?? "", "body", { maxLength: 100_000 }),
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
