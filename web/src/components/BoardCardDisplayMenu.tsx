@@ -1,4 +1,3 @@
-import { listenForOutsidePointerDown } from "../menuEvents";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { DragEvent } from "react";
 import { createPortal } from "react-dom";
@@ -17,7 +16,6 @@ export type BoardStatusPlacement = "main" | "sidebar" | "hidden";
 export interface BoardDisplaySettings {
   cover: boolean;
   body: boolean;
-  createdAt?: boolean;
   mainStatuses: OtherTaskTab[];
   sidebarStatuses: OtherTaskTab[];
   hiddenStatuses: OtherTaskTab[];
@@ -26,7 +24,6 @@ export interface BoardDisplaySettings {
 export const DEFAULT_BOARD_DISPLAY_SETTINGS: BoardDisplaySettings = {
   cover: true,
   body: false,
-  createdAt: false,
   mainStatuses: [...MAIN_STATUSES],
   sidebarStatuses: [...SECONDARY_STATUSES, "archived"],
   hiddenStatuses: [],
@@ -70,15 +67,20 @@ export function BoardCardDisplayMenu({
 
   useEffect(() => {
     if (!menuOpen) return;
-    const stopOutside = listenForOutsidePointerDown([menuRef, triggerRef], () => setMenuOpen(false));
+    function closeFromOutside(event: PointerEvent) {
+      if (!menuRef.current?.contains(event.target as Node) && !triggerRef.current?.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    }
     function closeFromEscape(event: KeyboardEvent) {
       if (event.key !== "Escape") return;
       setMenuOpen(false);
       triggerRef.current?.focus();
     }
+    document.addEventListener("pointerdown", closeFromOutside);
     document.addEventListener("keydown", closeFromEscape);
     return () => {
-      stopOutside();
+      document.removeEventListener("pointerdown", closeFromOutside);
       document.removeEventListener("keydown", closeFromEscape);
     };
   }, [menuOpen]);
@@ -204,19 +206,6 @@ export function BoardCardDisplayMenu({
           <span aria-hidden="true" />
         </button>
       </div>
-      <div className="project-automation-switch">
-        <span>{text("创建时间", "Creation date")}</span>
-        <button
-          type="button"
-          className={"board-setting-switch" + (settings.createdAt ? " is-on" : "")}
-          role="switch"
-          aria-label={text("显示创建时间", "Show creation date")}
-          aria-checked={Boolean(settings.createdAt)}
-          onClick={() => onChange({ ...settings, createdAt: !settings.createdAt })}
-        >
-          <span aria-hidden="true" />
-        </button>
-      </div>
       <button
         className="display-settings-more"
         type="button"
@@ -321,8 +310,6 @@ export function BoardCardDisplayMenu({
                         : <StatusIcon status={status as TaskStatus} color="var(--display-status-color)" size={15} />}
                       <span>{status === "archived"
                         ? text("已归档", "Archived")
-                        : status === "blocked"
-                          ? text("遇到阻碍（默认隐藏）", "Blocked (hidden by default)")
                         : taskStatusLabel(language, status)}</span>
                     </div>
                   );

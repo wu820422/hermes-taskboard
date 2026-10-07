@@ -1,4 +1,3 @@
-import { listenForOutsidePointerDown } from "../menuEvents";
 import {
   useEffect,
   useLayoutEffect,
@@ -124,7 +123,12 @@ export function TaskPropertyPicker<Value extends string>({
   useEffect(() => {
     if (!open) return;
 
-    const stopOutside = listenForOutsidePointerDown([rootRef, menuRef], () => onOpenChange(false));
+    function closeFromOutside(event: PointerEvent) {
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) {
+        onOpenChange(false);
+      }
+    }
 
     function closeFromEscape(event: globalThis.KeyboardEvent) {
       if (event.key !== "Escape") return;
@@ -139,15 +143,13 @@ export function TaskPropertyPicker<Value extends string>({
       onOpenChange(false);
     }
 
+    document.addEventListener("pointerdown", closeFromOutside);
     window.addEventListener("keydown", closeFromEscape);
-    const viewportListenerFrame = requestAnimationFrame(() => {
-      window.addEventListener("resize", closeFromViewportChange);
-      window.addEventListener("scroll", closeFromViewportChange, true);
-    });
+    window.addEventListener("resize", closeFromViewportChange);
+    window.addEventListener("scroll", closeFromViewportChange, true);
     return () => {
-      stopOutside();
+      document.removeEventListener("pointerdown", closeFromOutside);
       window.removeEventListener("keydown", closeFromEscape);
-      cancelAnimationFrame(viewportListenerFrame);
       window.removeEventListener("resize", closeFromViewportChange);
       window.removeEventListener("scroll", closeFromViewportChange, true);
     };

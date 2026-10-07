@@ -33,6 +33,7 @@ interface TaskboardGanttTask extends GanttTask {
 interface GanttViewProps {
   tasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
+  projectStartDate: string | null;
   hasActiveFilters: boolean;
   zoom: GanttZoom;
   hideCompleted: boolean;
@@ -44,9 +45,9 @@ interface GanttViewProps {
 let pendingDetailViewport: { projectId: string; x: number; y: number } | null = null;
 
 const GANTT_GROUPS: GanttGroupDefinition[] = [
-  { id: "in-progress", chineseLabel: "处理中", englishLabel: "In progress", statuses: ["in_progress"], defaultOpen: true },
-  { id: "in-review", chineseLabel: "等你确认", englishLabel: "In review", statuses: ["in_review"], defaultOpen: true },
-  { id: "blocked", chineseLabel: "遇到阻碍", englishLabel: "Blocked", statuses: ["blocked"], defaultOpen: true },
+  { id: "in-progress", chineseLabel: "處理中", englishLabel: "In progress", statuses: ["in_progress"], defaultOpen: true },
+  { id: "in-review", chineseLabel: "等你確認", englishLabel: "In review", statuses: ["in_review"], defaultOpen: true },
+  { id: "blocked", chineseLabel: "遇到阻礙", englishLabel: "Blocked", statuses: ["blocked"], defaultOpen: true },
   { id: "todo", chineseLabel: "待处理", englishLabel: "To do", statuses: ["backlog", "todo"], defaultOpen: true },
   { id: "done", chineseLabel: "已完成", englishLabel: "Completed", statuses: ["done"], defaultOpen: false },
   { id: "canceled", chineseLabel: "已取消", englishLabel: "Canceled", statuses: ["canceled"], defaultOpen: false },
@@ -106,7 +107,7 @@ function dateCellClass(date: Date) {
   return classes.join(" ");
 }
 
-export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCompleted, todayRequest, onOpenTask, onUpdate }: GanttViewProps) {
+export function GanttView({ tasks, presentations, projectStartDate, hasActiveFilters, zoom, hideCompleted, todayRequest, onOpenTask, onUpdate }: GanttViewProps) {
   const { language, locale, text } = useTaskboardI18n();
   const i18nRef = useRef({ language, locale, text });
   const containerRef = useRef<HTMLDivElement>(null);
@@ -446,7 +447,8 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
     const today = localDate(dateValue(new Date()));
     const scheduledStarts = scheduledTasks.map((task) => localDate(task.startDate!).getTime());
     const scheduledEnds = scheduledTasks.map((task) => localDate(task.dueDate!).getTime());
-    const rangeStart = new Date(Math.min(today.getTime(), ...scheduledStarts));
+    const projectStart = projectStartDate ? localDate(projectStartDate).getTime() : today.getTime();
+    const rangeStart = new Date(Math.min(projectStart, today.getTime(), ...scheduledStarts));
     const rangeEnd = new Date(Math.max(today.getTime(), ...scheduledEnds));
     const previousScroll = instance.getScrollState();
     const timelineWidth = containerRef.current?.querySelector<HTMLElement>(".gantt_task")?.clientWidth ?? 0;
@@ -469,7 +471,7 @@ export function GanttView({ tasks, presentations, hasActiveFilters, zoom, hideCo
     }
     if (restoredViewport) pendingDetailViewport = null;
     hasParsedDataRef.current = true;
-  }, [presentations, visibleTasks]);
+  }, [presentations, projectStartDate, visibleTasks]);
 
   useEffect(() => {
     ganttRef.current?.ext.zoom.setLevel(zoom);

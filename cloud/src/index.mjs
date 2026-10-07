@@ -1,43 +1,31 @@
-import {
-  parseMove, parseVersionMutation, parseRelationMutation,
-  parseCommentCreate, parseCommentPatch, parseTaskCreate,
-  parseCloudTaskPatch as parseTaskPatch,
-  parseCloudTaskFilters as parseTaskFilters,
-  parseCloudTaskTreeQuery as parseTaskTreeQuery,
-  parseCloudProjectReadmeSave as parseProjectReadmeSave,
-} from "../../shared/task-input.mjs";
-import { taskRelationsQuery, taskRelationsFromRows } from "../../shared/task-relations.mjs";
-import {
-  commentConversationTitle,
-  agentSessionFromRow,
-  threadBindingFromRow,
-  legacyLocalThreadIdFromRow,
-  storedThreadBinding,
-  attachTaskActivity,
-  taskActivityFromRow,
-  taskFieldChanges,
-  taskTreeNode,
-  projectReadmeAttachmentFromRow,
-  projectPrefix,
-} from "../../shared/task-records.mjs";
-import {
-  ApiError,
-  validateProjectId,
-  assertPlainObject,
-  assertAllowedKeys,
-  stringField,
-  slugify,
-  parseProjectLabel,
-} from "../../shared/api-fields.mjs";
 import { DurableObject } from "cloudflare:workers";
 
-import { DEFAULT_LABEL_NAMES, TASK_STATUSES, TASK_PRIORITIES } from "../../shared/domain.mjs";
+import { DEFAULT_LABEL_NAMES } from "../../shared/domain.mjs";
+import { fetchApplicationAsset } from "./static-assets.mjs";
+import { routeMcp, routeOAuth } from "./oauth-mcp.mjs";
+import {
+  assignCloudProjectPrefix,
+  cloudIdentifiersEnabled,
+  createCloudTaskIdentifier,
+  ensureCloudDevice,
+  handleSyncApi,
+} from "./sync-routes.mjs";
 
 const JSON_BODY_LIMIT = 1024 * 1024;
 const PROJECT_README_BODY_LIMIT = 3 * 1024 * 1024;
 const ATTACHMENT_BODY_LIMIT = 25 * 1024 * 1024;
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
-const PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX = "taskboard.project-board-display-settings.v3.";
+const PROJECT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const TASK_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "blocked",
+  "done",
+  "canceled",
+];
+const TASK_PRIORITIES = ["none", "urgent", "high", "medium", "low"];
 const INLINE_ATTACHMENT_TYPES = new Set([
   "application/pdf",
   "image/avif",
@@ -67,25 +55,6 @@ export class RealtimeHub extends DurableObject {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    if (url.pathname === "/client-storage") {
-      if (request.method === "GET") {
-        return json(200, {
-          entries: Object.fromEntries(await this.ctx.storage.list({
-            prefix: PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX,
-          })),
-        });
-      }
-      if (request.method === "PATCH") {
-        const { key, value } = await request.json();
-        if (value === null) await this.ctx.storage.delete(key);
-        else await this.ctx.storage.put(key, value);
-        return empty(204);
-      }
-      return json(405, {
-        error: { code: "METHOD_NOT_ALLOWED", message: "Method not allowed" },
-      }, { allow: "GET, PATCH" });
-    }
-
     if (url.pathname === "/broadcast" && request.method === "POST") {
       const payload = await request.json();
       if (!Number.isSafeInteger(payload?.revision) || payload.revision < 0) {
@@ -112,6 +81,15 @@ export class RealtimeHub extends DurableObject {
   }
 }
 
+class ApiError extends Error {
+  constructor(status, code, message, details) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
+
 function json(status, value, headers = {}) {
   return new Response(JSON.stringify(value), {
     status,
@@ -134,6 +112,151 @@ function methodNotAllowed(allowed) {
   throw new ApiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", {
     allowed,
   });
+}
+
+function assertPlainObject(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(400, "INVALID_BODY", "Request body must be a JSON object");
+  }
+}
+
+function assertAllowedKeys(value, allowed) {
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unknown.length > 0) {
+    throw new ApiError(
+      400,
+      "UNKNOWN_FIELD",
+      `Unknown field${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`,
+    );
+  }
+}
+
+function stringField(value, name, {
+  required = false,
+  nullable = false,
+  maxLength,
+} = {}) {
+  if (value === undefined) {
+    if (required) {
+      throw new ApiError(400, "INVALID_FIELD", `'${name}' is required`);
+    }
+    return undefined;
+  }
+  if (nullable && value === null) return null;
+  if (typeof value !== "string") {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      `'${name}' must be a string${nullable ? " or null" : ""}`,
+    );
+  }
+  const normalized = value.trim();
+  if (required && normalized.length === 0) {
+    throw new ApiError(400, "INVALID_FIELD", `'${name}' cannot be empty`);
+  }
+  if (normalized.length > maxLength) {
+    throw new ApiError(400, "INVALID_FIELD", `'${name}' cannot exceed ${maxLength} characters`);
+  }
+  return normalized;
+}
+
+function parseVersion(value, { allowZero = false } = {}) {
+  if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1)) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      `'version' must be a ${allowZero ? "non-negative" : "positive"} integer`,
+    );
+  }
+  return value;
+}
+
+function parseStatus(value, fallback) {
+  const status = value ?? fallback;
+  if (!TASK_STATUSES.includes(status)) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      `'status' must be one of: ${TASK_STATUSES.join(", ")}`,
+    );
+  }
+  return status;
+}
+
+function parsePriority(value, fallback) {
+  const priority = value ?? fallback;
+  if (!TASK_PRIORITIES.includes(priority)) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'priority' must be none, urgent, high, medium, or low",
+    );
+  }
+  return priority;
+}
+
+function parseLabels(value) {
+  if (!Array.isArray(value) || value.length > 20) {
+    throw new ApiError(400, "INVALID_FIELD", "'labels' must be an array with at most 20 entries");
+  }
+  const labels = value.map((label) => {
+    if (typeof label !== "string") {
+      throw new ApiError(400, "INVALID_FIELD", "Every label must be a string");
+    }
+    const normalized = label.trim();
+    if (normalized.length === 0 || normalized.length > 64) {
+      throw new ApiError(400, "INVALID_FIELD", "Labels must contain 1 to 64 characters");
+    }
+    return normalized;
+  });
+  if (new Set(labels).size !== labels.length) {
+    throw new ApiError(400, "INVALID_FIELD", "Labels must be unique");
+  }
+  return labels;
+}
+
+function parseSortOrder(value) {
+  if (
+    typeof value !== "number"
+    || !Number.isFinite(value)
+    || Math.abs(value) > 1_000_000_000_000
+  ) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'sortOrder' must be a finite number between -1000000000000 and 1000000000000",
+    );
+  }
+  return value;
+}
+
+function parseDueDate(value, name = "dueDate") {
+  const date = stringField(value, name, { nullable: true, maxLength: 10 });
+  if (date !== null && date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new ApiError(400, "INVALID_FIELD", `'${name}' must use YYYY-MM-DD`);
+  }
+  return date;
+}
+
+function parseRecurrence(value) {
+  if (value === null) return null;
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["interval", "unit"]));
+  if (!Number.isSafeInteger(value.interval) || value.interval < 1 || value.interval > 365) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'recurrence.interval' must be an integer from 1 to 365",
+    );
+  }
+  if (!["day", "week", "month", "year"].includes(value.unit)) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'recurrence.unit' must be day, week, month, or year",
+    );
+  }
+  return { interval: value.interval, unit: value.unit };
 }
 
 function parseDevelopmentContext(value) {
@@ -175,6 +298,100 @@ function parseDevelopmentContext(value) {
     "INVALID_FIELD",
     "'developmentContext.type' must be branch or worktree",
   );
+}
+
+function parseThreadId(value) {
+  if (value === undefined) return undefined;
+  return stringField(value, "threadId", { required: true, maxLength: 256 });
+}
+
+function parseThreadBinding(value) {
+  if (value === undefined || value === null) return value;
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "threadId",
+    "codexProjectId",
+    "codexProjectKind",
+    "codexHostId",
+    "workspacePath",
+  ]));
+  const threadId = stringField(value.threadId, "threadBinding.threadId", {
+    required: true,
+    maxLength: 256,
+  });
+  const identityFields = [
+    value.codexProjectId,
+    value.codexProjectKind,
+    value.codexHostId,
+    value.workspacePath,
+  ];
+  if (identityFields.every((field) => field === undefined)) return { threadId };
+  if (identityFields.some((field) => field === undefined)) {
+    throw new ApiError(400, "INVALID_FIELD", "Thread identity must include project, kind, host, and workspace");
+  }
+  const codexProjectId = stringField(value.codexProjectId, "threadBinding.codexProjectId", {
+    required: true,
+    maxLength: 256,
+  });
+  const codexProjectKind = value.codexProjectKind;
+  const codexHostId = stringField(value.codexHostId, "threadBinding.codexHostId", {
+    required: true,
+    maxLength: 256,
+  });
+  const workspacePath = stringField(value.workspacePath, "threadBinding.workspacePath", {
+    required: true,
+    maxLength: 4096,
+  });
+  if (
+    (codexProjectKind !== "local" && codexProjectKind !== "remote")
+    || (codexProjectKind === "local" && codexHostId !== "local")
+    || (codexProjectKind === "remote" && codexHostId === "local")
+    || workspacePath.includes("\0")
+  ) {
+    throw new ApiError(400, "INVALID_FIELD", "Thread project identity is invalid");
+  }
+  return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
+}
+
+function parseAssigneeTarget(value) {
+  if (value === undefined) return undefined;
+  if (!["current-user", "codex-agent"].includes(value)) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'assigneeTarget' must be current-user or codex-agent",
+    );
+  }
+  return value;
+}
+
+function slugify(value) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+function validateProjectId(value) {
+  const id = stringField(value, "id", { required: true, maxLength: 64 });
+  if (!PROJECT_ID_PATTERN.test(id)) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'id' must be a lowercase slug containing letters, numbers, or hyphens",
+    );
+  }
+  return id;
+}
+
+function projectPrefix(project) {
+  const idPrefix = project.id.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 12) || "TASK";
+  const existingPrefix = project.first_identifier?.replace(/-\d+$/, "");
+  if (existingPrefix && /^[A-Z0-9]+$/i.test(existingPrefix) && existingPrefix !== idPrefix) return existingPrefix;
+  if (idPrefix.length <= 5) return idPrefix;
+  const namePrefix = project.name.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 3);
+  return namePrefix || idPrefix.slice(0, 3);
 }
 
 function now() {
@@ -288,7 +505,64 @@ function unauthorized() {
   );
 }
 
+async function routeBrowserLogin(request, env, url) {
+  if (url.pathname !== "/login") return null;
+  if (request.method === "GET") {
+    const next = url.searchParams.get("next")?.startsWith("/") ? url.searchParams.get("next") : "/";
+    return new Response(`<!doctype html><meta charset="utf-8"><title>登入 Hermes Taskboard</title><style>body{font:16px system-ui;background:#111;color:#eee;display:grid;place-items:center;min-height:100vh}form{width:min(420px,90vw);padding:28px;background:#1d1d1d;border-radius:16px}input,button{box-sizing:border-box;width:100%;padding:12px;margin-top:12px;border-radius:8px}button{background:#00cdd7;border:0;font-weight:700}</style><form method="post"><h1>Hermes Taskboard</h1><p>輸入瀏覽器登入碼以載入共用任務資料。</p><input type="hidden" name="next" value="${encodeURIComponent(next)}"><input name="username" value="Leo" required aria-label="名稱"><input name="code" type="password" required autofocus placeholder="瀏覽器登入碼" aria-label="瀏覽器登入碼"><button>登入任務面板</button></form>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+  }
+  if (request.method !== "POST") methodNotAllowed(["GET", "POST"]);
+  const params = new URLSearchParams(await request.text());
+  const supplied = params.get("code") ?? "";
+  const valid = supplied !== "" && (
+    supplied === env.TASKBOARD_BROWSER_CODE
+    || supplied === env.TASKBOARD_SHARED_SECRET
+  );
+  if (!valid) return json(401, { error: { code: "UNAUTHORIZED", message: "Invalid browser login code" } });
+  const username = stringField(params.get("username") ?? "Leo", "username", { required: true, maxLength: 120 });
+  const next = decodeURIComponent(params.get("next") ?? "/");
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: new URL(next.startsWith("/") ? next : "/", url.origin).href,
+      "set-cookie": await createSessionCookie(username, env.TASKBOARD_SHARED_SECRET),
+    },
+  });
+}
+
 async function authenticate(request, env) {
+  const allowsSiteAuthentication = env.TASKBOARD_AUTH_MODE === "chatgpt-site"
+    || env.TASKBOARD_AUTH_MODE === "hybrid";
+  if (allowsSiteAuthentication) {
+    const email = request.headers.get("oai-authenticated-user-email")?.trim().toLowerCase();
+    const allowedEmail = env.TASKBOARD_ALLOWED_EMAIL?.trim().toLowerCase();
+    if (email && allowedEmail && email === allowedEmail) {
+    const encodedName = request.headers.get("oai-authenticated-user-full-name");
+    const nameEncoding = request.headers.get("oai-authenticated-user-full-name-encoding");
+    let name = email;
+    if (encodedName && nameEncoding === "percent-encoded-utf-8") {
+      try {
+        const decoded = decodeURIComponent(encodedName).trim();
+        if (decoded) name = decoded;
+      } catch {
+        // Fall back to the authenticated email when the display name is malformed.
+      }
+    }
+      return {
+        actor: {
+          type: request.headers.get("x-taskboard-client") === "taskctl" ? "agent" : "user",
+          id: `chatgpt:${encodeURIComponent(email)}`,
+          name: request.headers.get("x-taskboard-client") === "taskctl"
+            ? `Codex Agent (${name})`
+            : name,
+          avatarUrl: null,
+          username: email,
+        },
+        sessionCookie: null,
+      };
+    }
+    if (env.TASKBOARD_AUTH_MODE === "chatgpt-site") return null;
+  }
   if (typeof env.TASKBOARD_SHARED_SECRET !== "string" || env.TASKBOARD_SHARED_SECRET === "") {
     throw new ApiError(
       500,
@@ -467,6 +741,57 @@ function developmentContextFromRow(row) {
   return null;
 }
 
+function commentConversationTitle(body) {
+  const firstLine = String(body ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  if (!firstLine) return "评论";
+  const compact = firstLine.replace(/\s+/g, " ");
+  return compact.length > 80 ? `${compact.slice(0, 77)}…` : compact;
+}
+
+function threadBindingFromRow(row) {
+  if (
+    !row.thread_id
+    || !row.thread_codex_project_id
+    || !row.thread_codex_project_kind
+    || !row.thread_codex_host_id
+    || !row.thread_workspace_path
+  ) return null;
+  return {
+    threadId: row.thread_id,
+    codexProjectId: row.thread_codex_project_id,
+    codexProjectKind: row.thread_codex_project_kind,
+    codexHostId: row.thread_codex_host_id,
+    workspacePath: row.thread_workspace_path,
+  };
+}
+
+function legacyLocalThreadIdFromRow(row) {
+  if (!row.thread_id) return null;
+  return [
+    row.thread_codex_project_id,
+    row.thread_codex_project_kind,
+    row.thread_codex_host_id,
+    row.thread_workspace_path,
+  ].every((value) => value == null)
+    ? row.thread_id
+    : null;
+}
+
+function storedThreadBinding(threadBinding, threadId) {
+  if (threadBinding === undefined && (threadId === undefined || threadId === null)) return undefined;
+  const binding = threadBinding === undefined ? { threadId } : threadBinding;
+  return [
+    binding?.threadId ?? null,
+    binding?.codexProjectId ?? null,
+    binding?.codexProjectKind ?? null,
+    binding?.codexHostId ?? null,
+    binding?.workspacePath ?? null,
+  ];
+}
+
 function storedThreadBindingForExisting(current, threadBinding, threadId) {
   const currentBinding = threadBindingFromRow(current);
   if (
@@ -477,6 +802,113 @@ function storedThreadBindingForExisting(current, threadBinding, threadId) {
     return storedThreadBinding(currentBinding, threadId);
   }
   return storedThreadBinding(threadBinding, threadId);
+}
+
+function attachTaskActivity(task, comments, activities, previewImage = null) {
+  const orderedComments = [...comments].sort((left, right) => left.id.localeCompare(right.id));
+  const orderedActivities = [...activities].sort((left, right) => left.id.localeCompare(right.id));
+  const participants = [];
+  const participantIds = new Set();
+  const addParticipant = (actor) => {
+    const key = `${actor.type}:${actor.id}`;
+    if (participantIds.has(key)) return;
+    participantIds.add(key);
+    participants.push(actor);
+  };
+  addParticipant({
+    type: task.creatorType,
+    id: task.creatorId,
+    name: task.creatorName,
+    avatarUrl: task.creatorAvatarUrl,
+  });
+  addParticipant(task.assignee);
+  for (const comment of orderedComments) {
+    addParticipant({
+      type: comment.author_type,
+      id: comment.author_id,
+      name: comment.author_name,
+      avatarUrl: comment.author_avatar_url,
+    });
+  }
+  for (const activity of orderedActivities) {
+    addParticipant({
+      type: activity.actor_type,
+      id: activity.actor_id,
+      name: activity.actor_name,
+      avatarUrl: activity.actor_avatar_url,
+    });
+  }
+  const conversationRefs = [];
+  if (task.threadBinding) {
+    conversationRefs.push({
+      ...task.threadBinding,
+      source: "task",
+      sourceId: task.id,
+      title: task.title,
+      updatedAt: task.updatedAt,
+    });
+  } else if (task.legacyLocalThreadId) {
+    conversationRefs.push({
+      threadId: task.legacyLocalThreadId,
+      legacyLocal: true,
+      source: "task",
+      sourceId: task.id,
+      title: task.title,
+      updatedAt: task.updatedAt,
+    });
+  }
+  for (const comment of orderedComments) {
+    const threadBinding = threadBindingFromRow(comment);
+    const legacyLocalThreadId = legacyLocalThreadIdFromRow(comment);
+    if (threadBinding || legacyLocalThreadId) {
+      conversationRefs.push({
+        ...(threadBinding ?? { threadId: legacyLocalThreadId, legacyLocal: true }),
+        source: "comment",
+        sourceId: comment.id,
+        title: commentConversationTitle(comment.body),
+        updatedAt: comment.updated_at,
+      });
+    }
+  }
+  task.conversationRefs = conversationRefs;
+  task.participants = participants;
+  task.previewImage = previewImage;
+  task.activityKey = JSON.stringify({
+    version: 1,
+    task: [task.id, task.version, task.updatedAt],
+    comments: orderedComments.map((comment) => [comment.id, comment.version, comment.updated_at]),
+    changes: orderedActivities.map((activity) => [activity.id, activity.created_at]),
+  });
+  task.activityUpdatedAt = [...orderedComments, ...orderedActivities].reduce(
+    (latest, activity) => {
+      const updatedAt = activity.updated_at ?? activity.created_at;
+      return updatedAt > latest ? updatedAt : latest;
+    },
+    task.updatedAt,
+  );
+  return task;
+}
+
+function taskActivityFromRow(row) {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    actorType: row.actor_type,
+    actorId: row.actor_id,
+    actorName: row.actor_name,
+    actorAvatarUrl: row.actor_avatar_url,
+    changes: JSON.parse(row.changes),
+    createdAt: row.created_at,
+  };
+}
+
+function taskFieldChanges(task, changes) {
+  return Object.entries(changes).flatMap(([field, after]) => {
+    const before = task[field];
+    return JSON.stringify(before) === JSON.stringify(after)
+      ? []
+      : [{ field, before, after }];
+  });
 }
 
 function relationActivityValue(type, task) {
@@ -501,7 +933,6 @@ function taskFromRow(row) {
     threadId: row.thread_id,
     threadBinding: threadBindingFromRow(row),
     legacyLocalThreadId: legacyLocalThreadIdFromRow(row),
-    agentSession: agentSessionFromRow(row),
     creatorType: row.creator_type,
     creatorId: row.creator_id,
     creatorName: row.creator_name,
@@ -543,6 +974,22 @@ function taskRelationSummaryFromRow(row) {
   };
 }
 
+function taskTreeNode(row, parentId, depth, path) {
+  return {
+    id: row.id,
+    parentId,
+    depth,
+    path,
+    summary: {
+      identifier: row.identifier,
+      title: row.title,
+      status: row.status,
+      priority: row.priority,
+      archivedAt: row.archived_at,
+    },
+  };
+}
+
 function commentFromRow(row, attachments = []) {
   return {
     id: row.id,
@@ -551,7 +998,6 @@ function commentFromRow(row, attachments = []) {
     threadId: row.thread_id,
     threadBinding: threadBindingFromRow(row),
     legacyLocalThreadId: legacyLocalThreadIdFromRow(row),
-    agentSession: agentSessionFromRow(row),
     authorType: row.author_type,
     authorId: row.author_id,
     authorName: row.author_name,
@@ -569,7 +1015,18 @@ function attachmentFromRow(row) {
     taskId: row.task_id,
     commentId: row.comment_id,
     kind: row.kind,
-    bodyFallback: row.body_fallback === 1,
+    filename: row.filename,
+    contentType: row.content_type,
+    size: row.size,
+    createdAt: row.created_at,
+  };
+}
+
+function projectReadmeAttachmentFromRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    kind: "inline",
     filename: row.filename,
     contentType: row.content_type,
     size: row.size,
@@ -657,91 +1114,98 @@ async function hydrateComment(env, row) {
   return commentFromRow(row, await attachmentsForComment(env, row.id));
 }
 
-async function hydrateComments(env, rows) {
-  const attachmentsByComment = new Map(rows.map((row) => [row.id, []]));
-  const commentIds = rows.map((row) => row.id);
-  const batches = [];
-  for (let offset = 0; offset < commentIds.length; offset += 80) {
-    const chunk = commentIds.slice(offset, offset + 80);
-    const placeholders = chunk.map(() => "?").join(", ");
-    batches.push(all(env.DB.prepare(`
-      SELECT * FROM attachments
-      WHERE comment_id IN (${placeholders})
-      ORDER BY comment_id, created_at, id
-    `).bind(...chunk)));
-  }
-  for (const attachments of await Promise.all(batches)) {
-    for (const attachment of attachments) {
-      attachmentsByComment.get(attachment.comment_id).push(attachmentFromRow(attachment));
-    }
-  }
-  return rows.map((row) => commentFromRow(row, attachmentsByComment.get(row.id)));
-}
-
-async function taskRelationsForTasks(env, taskIds) {
-  const relationsByTask = new Map();
-  const batches = [];
-  for (let offset = 0; offset < taskIds.length; offset += 80) {
-    const chunk = taskIds.slice(offset, offset + 80);
-    const placeholders = chunk.map(() => "?").join(", ");
-    batches.push(all(env.DB.prepare(taskRelationsQuery(placeholders)).bind(...chunk)).then(
-      (rows) => taskRelationsFromRows(chunk, rows, taskRelationSummaryFromRow),
-    ));
-  }
-  for (const batch of await Promise.all(batches)) {
-    for (const [taskId, relations] of batch) relationsByTask.set(taskId, relations);
-  }
-  return relationsByTask;
-}
-
-async function taskPreviewImages(env, taskIds) {
-  const imagesByTask = new Map();
-  const batches = [];
-  for (let offset = 0; offset < taskIds.length; offset += 80) {
-    const chunk = taskIds.slice(offset, offset + 80);
-    const placeholders = chunk.map(() => "?").join(", ");
-    batches.push(all(env.DB.prepare(`
+async function hydrateTask(env, row, activityComments = null, activityChanges = null, listContext = null) {
+  const task = taskFromRow(row);
+  const [parent, subIssues, blockedBy, blocks, related, previewImageRow] = listContext ? listContext.get(task.id) : await Promise.all([
+    env.DB.prepare(`
+      SELECT tasks.*
+      FROM task_relations
+      JOIN tasks ON tasks.id = task_relations.source_task_id
+      WHERE task_relations.relation_type = 'parent'
+        AND task_relations.target_task_id = ?
+    `).bind(task.id).first(),
+    all(env.DB.prepare(`
+      SELECT tasks.*
+      FROM task_relations
+      JOIN tasks ON tasks.id = task_relations.target_task_id
+      WHERE task_relations.relation_type = 'parent'
+        AND task_relations.source_task_id = ?
+      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
+    `).bind(task.id)),
+    all(env.DB.prepare(`
+      SELECT tasks.*
+      FROM task_relations
+      JOIN tasks ON tasks.id = task_relations.source_task_id
+      WHERE task_relations.relation_type = 'blocks'
+        AND task_relations.target_task_id = ?
+      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
+    `).bind(task.id)),
+    all(env.DB.prepare(`
+      SELECT tasks.*
+      FROM task_relations
+      JOIN tasks ON tasks.id = task_relations.target_task_id
+      WHERE task_relations.relation_type = 'blocks'
+        AND task_relations.source_task_id = ?
+      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
+    `).bind(task.id)),
+    all(env.DB.prepare(`
+      SELECT tasks.*
+      FROM task_relations
+      JOIN tasks ON tasks.id = CASE
+        WHEN task_relations.source_task_id = ? THEN task_relations.target_task_id
+        ELSE task_relations.source_task_id
+      END
+      WHERE task_relations.relation_type = 'related'
+        AND (
+          task_relations.source_task_id = ?
+          OR task_relations.target_task_id = ?
+        )
+      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
+    `).bind(task.id, task.id, task.id)),
+    env.DB.prepare(`
       SELECT attachments.*
       FROM attachments
       JOIN tasks ON tasks.id = attachments.task_id
-      WHERE attachments.task_id IN (${placeholders})
+      WHERE attachments.task_id = ?
         AND attachments.comment_id IS NULL
         AND attachments.content_type LIKE 'image/%'
         AND instr(tasks.description, 'api/attachments/' || attachments.id || '/content') > 0
-      ORDER BY attachments.task_id, attachments.created_at, attachments.id
-    `).bind(...chunk)));
-  }
-  for (const rows of await Promise.all(batches)) {
-    for (const row of rows) {
-      if (!imagesByTask.has(row.task_id)) imagesByTask.set(row.task_id, attachmentFromRow(row));
-    }
-  }
-  return imagesByTask;
-}
-
-async function hydrateTasks(env, rows) {
-  const taskIds = rows.map((row) => row.id);
-  const [relationsByTask, commentsByTask, activitiesByTask, previewImagesByTask] = await Promise.all([
-    taskRelationsForTasks(env, taskIds),
-    taskActivityComments(env, taskIds),
-    taskActivitiesForTasks(env, taskIds),
-    taskPreviewImages(env, taskIds),
+      ORDER BY attachments.created_at, attachments.id
+      LIMIT 1
+    `).bind(task.id).first(),
   ]);
-  return rows.map((row) => {
-    const task = taskFromRow(row);
-    task.relations = relationsByTask.get(row.id);
-    return attachTaskActivity(
-      task,
-      commentsByTask.get(row.id) ?? [],
-      activitiesByTask.get(row.id) ?? [],
-      previewImagesByTask.get(row.id) ?? null,
-    );
-  });
-}
-
-async function hydrateTask(env, row) {
-  const [task] = await hydrateTasks(env, [row]);
-  return task;
+  task.relations = {
+    parent: parent ? taskRelationSummaryFromRow(parent) : null,
+    subIssues: subIssues.map(taskRelationSummaryFromRow),
+    blockedBy: blockedBy.map(taskRelationSummaryFromRow),
+    blocks: blocks.map(taskRelationSummaryFromRow),
+    related: related.map(taskRelationSummaryFromRow),
+  };
+  const comments = activityComments ?? await all(env.DB.prepare(`
+    SELECT
+      id, task_id,
+      CASE WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
+      thread_id, thread_codex_project_id, thread_codex_project_kind,
+      thread_codex_host_id, thread_workspace_path,
+      author_type, author_id, author_name,
+      author_avatar_url, version, updated_at
+    FROM comments
+    WHERE task_id = ?
+    ORDER BY id
+  `).bind(task.id));
+  const activities = activityChanges ?? await all(env.DB.prepare(`
+    SELECT
+      id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, created_at
+    FROM task_activities
+    WHERE task_id = ?
+    ORDER BY created_at, id
+  `).bind(task.id));
+  return attachTaskActivity(
+    task,
+    comments,
+    activities,
+    previewImageRow ? attachmentFromRow(previewImageRow) : null,
+  );
 }
 
 async function getTask(env, id) {
@@ -825,9 +1289,9 @@ async function taskActivityComments(env, taskIds) {
     batches.push(all(env.DB.prepare(`
       SELECT
         id, task_id,
-        CASE WHEN thread_id IS NULL AND agent_session IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
+        CASE WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
         thread_id, thread_codex_project_id, thread_codex_project_kind,
-        thread_codex_host_id, thread_workspace_path, agent_session,
+        thread_codex_host_id, thread_workspace_path,
         author_type, author_id, author_name,
         author_avatar_url, version, updated_at
       FROM comments
@@ -879,24 +1343,243 @@ function parseProjectCreate(body) {
   return { id, name };
 }
 
-function parseClientStorageUpdate(body) {
+function parseProjectLabel(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["key", "value"]));
-  const key = stringField(body.key, "key", { required: true, maxLength: 512 });
-  if (
-    !key.startsWith(PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX)
-    || key.length === PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX.length
-  ) {
-    throw new ApiError(
-      400,
-      "INVALID_FIELD",
-      "'key' must identify project board display settings",
-    );
+  assertAllowedKeys(body, new Set(["label"]));
+  return stringField(body.label, "label", { required: true, maxLength: 64 });
+}
+
+function parseTaskCreate(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "projectId",
+    "title",
+    "description",
+    "status",
+    "priority",
+    "labels",
+    "sortOrder",
+    "threadId",
+    "threadBinding",
+    "assigneeTarget",
+    "developmentContext",
+    "startDate",
+    "dueDate",
+    "recurrence",
+  ]));
+  const input = {
+    projectId: validateProjectId(body.projectId ?? "local"),
+    title: stringField(body.title, "title", { required: true, maxLength: 240 }),
+    description: stringField(body.description ?? "", "description", { maxLength: 100_000 }),
+    status: parseStatus(body.status, "backlog"),
+    priority: parsePriority(body.priority, "none"),
+    labels: body.labels === undefined ? [] : parseLabels(body.labels),
+    sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
+    threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
+    assigneeTarget: parseAssigneeTarget(body.assigneeTarget),
+    developmentContext: parseDevelopmentContext(body.developmentContext ?? null),
+    startDate: parseDueDate(body.startDate ?? null, "startDate"),
+    dueDate: parseDueDate(body.dueDate ?? null),
+    recurrence: parseRecurrence(body.recurrence ?? null),
+  };
+  if (input.recurrence && !input.dueDate) {
+    throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires 'dueDate'");
+  }
+  return input;
+}
+
+function parseIntegrationTaskUpsert(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "projectId", "title", "description", "status", "priority", "labels",
+    "externalOrigin", "externalKey", "externalUrl",
+  ]));
+  return {
+    projectId: validateProjectId(body.projectId),
+    title: stringField(body.title, "title", { required: true, maxLength: 240 }),
+    description: stringField(body.description ?? "", "description", { maxLength: 100_000 }),
+    status: parseStatus(body.status, "todo"),
+    priority: parsePriority(body.priority, "none"),
+    labels: body.labels === undefined ? [] : parseLabels(body.labels),
+    externalOrigin: stringField(body.externalOrigin, "externalOrigin", { required: true, maxLength: 120 }),
+    externalKey: stringField(body.externalKey, "externalKey", { required: true, maxLength: 512 }),
+    externalUrl: body.externalUrl == null ? null : stringField(body.externalUrl, "externalUrl", { maxLength: 4096 }),
+  };
+}
+
+function parseIntegrationTaskAdopt(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "projectId", "externalOrigin", "externalKey", "legacyTaskId", "duplicateTaskId",
+  ]));
+  return {
+    projectId: validateProjectId(body.projectId),
+    externalOrigin: stringField(body.externalOrigin, "externalOrigin", { required: true, maxLength: 120 }),
+    externalKey: stringField(body.externalKey, "externalKey", { required: true, maxLength: 512 }),
+    legacyTaskId: stringField(body.legacyTaskId, "legacyTaskId", { required: true, maxLength: 128 }),
+    duplicateTaskId: stringField(body.duplicateTaskId, "duplicateTaskId", { required: true, maxLength: 128 }),
+  };
+}
+
+function parseTaskPatch(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "version",
+    "projectId",
+    "title",
+    "description",
+    "status",
+    "priority",
+    "labels",
+    "threadId",
+    "threadBinding",
+    "assigneeTarget",
+    "developmentContext",
+    "startDate",
+    "dueDate",
+    "recurrence",
+  ]));
+  const changes = {};
+  if (body.projectId !== undefined) changes.projectId = validateProjectId(body.projectId);
+  if (body.title !== undefined) {
+    changes.title = stringField(body.title, "title", { required: true, maxLength: 240 });
+  }
+  if (body.description !== undefined) {
+    changes.description = stringField(body.description, "description", { maxLength: 100_000 });
+  }
+  if (body.status !== undefined) changes.status = parseStatus(body.status);
+  if (body.priority !== undefined) changes.priority = parsePriority(body.priority);
+  if (body.labels !== undefined) changes.labels = parseLabels(body.labels);
+  if (body.developmentContext !== undefined) {
+    changes.developmentContext = parseDevelopmentContext(body.developmentContext);
+  }
+  if (body.startDate !== undefined) changes.startDate = parseDueDate(body.startDate, "startDate");
+  if (body.dueDate !== undefined) changes.dueDate = parseDueDate(body.dueDate);
+  if (body.recurrence !== undefined) changes.recurrence = parseRecurrence(body.recurrence);
+  const assigneeTarget = parseAssigneeTarget(body.assigneeTarget);
+  if (Object.keys(changes).length === 0 && assigneeTarget === undefined) {
+    throw new ApiError(400, "INVALID_BODY", "PATCH requires at least one task field");
   }
   return {
-    key,
-    value: stringField(body.value, "value", { nullable: true, maxLength: 100_000 }),
+    version: parseVersion(body.version),
+    changes,
+    threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
+    assigneeTarget,
   };
+}
+
+function parseMove(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "status", "sortOrder", "threadId", "threadBinding"]));
+  return {
+    version: parseVersion(body.version),
+    status: parseStatus(body.status),
+    sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
+    threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
+  };
+}
+
+function parseVersionMutation(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding"]));
+  return {
+    version: parseVersion(body.version),
+    threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
+  };
+}
+
+function parseRelationOrigin(value) {
+  if (value === undefined) return undefined;
+  if (value !== "manual" && value !== "mention") {
+    throw new ApiError(400, "INVALID_FIELD", "'origin' must be manual or mention");
+  }
+  return value;
+}
+
+function parseRelationMutation(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding", "origin"]));
+  return {
+    version: parseVersion(body.version),
+    threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
+    origin: parseRelationOrigin(body.origin),
+  };
+}
+
+function parseCommentCreate(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["body", "threadId", "threadBinding"]));
+  return {
+    body: stringField(body.body ?? "", "body", { maxLength: 100_000 }),
+    threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
+  };
+}
+
+function parseCommentPatch(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "body", "threadId", "threadBinding"]));
+  if (body.body === undefined) {
+    throw new ApiError(400, "INVALID_FIELD", "'body' is required");
+  }
+  return {
+    version: parseVersion(body.version),
+    body: stringField(body.body, "body", { maxLength: 100_000 }),
+    threadId: parseThreadId(body.threadId),
+    threadBinding: parseThreadBinding(body.threadBinding),
+  };
+}
+
+function parseTaskFilters(searchParams) {
+  const allowed = new Set(["projectId", "status", "archived"]);
+  for (const key of searchParams.keys()) {
+    if (!allowed.has(key)) {
+      throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", `Unknown query parameter: ${key}`);
+    }
+    if (searchParams.getAll(key).length > 1) {
+      throw new ApiError(400, "INVALID_QUERY_PARAMETER", `'${key}' cannot be repeated`);
+    }
+  }
+  const projectId = searchParams.get("projectId");
+  const status = searchParams.get("status");
+  const archived = searchParams.get("archived") ?? "false";
+  if (projectId !== null) validateProjectId(projectId);
+  if (status !== null) parseStatus(status);
+  if (!["false", "true", "all"].includes(archived)) {
+    throw new ApiError(
+      400,
+      "INVALID_QUERY_PARAMETER",
+      "'archived' must be false, true, or all",
+    );
+  }
+  return { projectId, status, archived };
+}
+
+function parseTaskTreeQuery(searchParams) {
+  const allowed = new Set(["direction", "depth"]);
+  for (const key of searchParams.keys()) {
+    if (!allowed.has(key)) {
+      throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", `Unknown query parameter: ${key}`);
+    }
+    if (searchParams.getAll(key).length !== 1) {
+      throw new ApiError(400, "INVALID_TREE_QUERY", `'${key}' cannot be repeated`);
+    }
+  }
+  const direction = searchParams.get("direction");
+  if (direction !== "descendants" && direction !== "ancestors") {
+    throw new ApiError(400, "INVALID_TREE_QUERY", "'direction' must be descendants or ancestors");
+  }
+  const rawDepth = searchParams.get("depth");
+  const depth = Number(rawDepth);
+  if (!/^\d+$/.test(rawDepth ?? "") || !Number.isSafeInteger(depth) || depth < 1 || depth > 25) {
+    throw new ApiError(400, "INVALID_TREE_QUERY", "'depth' must be an integer from 1 to 25");
+  }
+  return { direction, depth };
 }
 
 function parseAfterCursor(searchParams) {
@@ -993,6 +1676,7 @@ async function createProject(env, input) {
     }
     throw error;
   }
+  await assignCloudProjectPrefix(env, { id: input.id, name: input.name });
   return getProject(env, input.id);
 }
 
@@ -1068,6 +1752,42 @@ async function deleteProject(env, id) {
   return project;
 }
 
+async function taskListContext(env, rows) {
+  const [allTasks, relations, images] = await Promise.all([
+    all(env.DB.prepare("SELECT * FROM tasks ORDER BY sort_order, created_at, id")),
+    all(env.DB.prepare("SELECT * FROM task_relations")),
+    all(env.DB.prepare("SELECT * FROM attachments WHERE comment_id IS NULL AND content_type LIKE 'image/%' ORDER BY created_at, id")),
+  ]);
+  const byId = new Map(allTasks.map((row) => [row.id, row]));
+  const context = new Map(rows.map((row) => [row.id, [null, [], [], [], [], null]]));
+  for (const relation of relations) {
+    const source = context.get(relation.source_task_id);
+    const target = context.get(relation.target_task_id);
+    const sourceRow = byId.get(relation.source_task_id);
+    const targetRow = byId.get(relation.target_task_id);
+    if (relation.relation_type === "parent") {
+      if (source && targetRow) source[1].push(targetRow);
+      if (target && sourceRow) target[0] = sourceRow;
+    } else if (relation.relation_type === "blocks") {
+      if (source && targetRow) source[3].push(targetRow);
+      if (target && sourceRow) target[2].push(sourceRow);
+    } else if (relation.relation_type === "related") {
+      if (source && targetRow) source[4].push(targetRow);
+      if (target && sourceRow) target[4].push(sourceRow);
+    }
+  }
+  const rank = new Map(allTasks.map((row, index) => [row.id, index]));
+  for (const value of context.values()) {
+    for (const index of [1, 2, 3, 4]) value[index].sort((a, b) => rank.get(a.id) - rank.get(b.id));
+  }
+  for (const image of images) {
+    const value = context.get(image.task_id);
+    const task = byId.get(image.task_id);
+    if (value && !value[5] && (task.description ?? "").includes("api/attachments/" + image.id + "/content")) value[5] = image;
+  }
+  return context;
+}
+
 async function listTasks(env, filters) {
   const where = [];
   const values = [];
@@ -1103,10 +1823,87 @@ async function listTasks(env, filters) {
         id
     `).bind(...values),
   );
-  return hydrateTasks(env, rows);
+  const taskIds = rows.map((row) => row.id);
+  const [commentsByTask, activitiesByTask, listContext] = await Promise.all([
+    taskActivityComments(env, taskIds),
+    taskActivitiesForTasks(env, taskIds),
+    taskListContext(env, rows),
+  ]);
+  return Promise.all(rows.map((row) => hydrateTask(
+    env,
+    row,
+    commentsByTask.get(row.id) ?? [],
+    activitiesByTask.get(row.id) ?? [],
+    listContext,
+  )));
+}
+
+async function createTaskV2(env, input, actor) {
+  const project = await env.DB.prepare(`
+    SELECT projects.id, projects.name, projects.identifier_prefix,
+      (SELECT tasks.identifier FROM tasks WHERE tasks.project_id = projects.id ORDER BY tasks.created_at, tasks.id LIMIT 1) AS first_identifier
+    FROM projects WHERE projects.id = ?
+  `).bind(input.projectId).first();
+  if (!project) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
+  const identifier = await createCloudTaskIdentifier(env, project);
+  const id = uuid();
+  const timestamp = now();
+  const assignee = resolveAssignee(input.assigneeTarget, actor);
+  let sortOrder = input.sortOrder;
+  if (sortOrder === undefined) {
+    const row = await env.DB.prepare(`
+      SELECT COALESCE(MAX(sort_order), 0) AS maximum
+      FROM tasks WHERE project_id = ? AND status = ? AND archived_at IS NULL
+    `).bind(input.projectId, input.status).first();
+    sortOrder = row.maximum + 1000;
+  }
+  const thread = storedThreadBinding(input.threadBinding, input.threadId) ?? [null, null, null, null, null];
+  await env.DB.prepare(`
+    INSERT INTO tasks (
+      id, identifier, project_id, title, description, status, priority, labels,
+      sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
+      thread_codex_host_id, thread_workspace_path,
+      creator_type, creator_id, creator_name, creator_avatar_url,
+      assignee_type, assignee_id, assignee_name, assignee_avatar_url,
+      development_context_type, development_branch,
+      start_date, due_date, recurrence_interval, recurrence_unit,
+      archived_at, version, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+  `).bind(
+    id,
+    identifier,
+    input.projectId,
+    input.title,
+    input.description,
+    input.status,
+    input.priority,
+    JSON.stringify(input.labels),
+    sortOrder,
+    ...thread,
+    actor.type,
+    actor.id,
+    actor.name,
+    actor.avatarUrl,
+    assignee.type,
+    assignee.id,
+    assignee.name,
+    assignee.avatarUrl,
+    input.developmentContext?.type ?? null,
+    input.developmentContext?.branch ?? null,
+    input.startDate,
+    input.dueDate,
+    input.recurrence?.interval ?? null,
+    input.recurrence?.unit ?? null,
+    timestamp,
+    timestamp,
+  ).run();
+  await env.DB.prepare("UPDATE identifier_allocations SET task_id = ? WHERE identifier = ?").bind(id, identifier).run();
+  return getTask(env, id);
 }
 
 async function createTask(env, input, actor) {
+  await ensureCloudDevice(env);
+  if (await cloudIdentifiersEnabled(env)) return createTaskV2(env, input, actor);
   const project = await env.DB.prepare(`
     SELECT
       projects.id,
@@ -1148,7 +1945,7 @@ async function createTask(env, input, actor) {
         assignee_type, assignee_id, assignee_name, assignee_avatar_url,
         development_context_type, development_branch,
         start_date, due_date, recurrence_interval, recurrence_unit,
-        archived_at, version, created_at, updated_at, agent_session
+        archived_at, version, created_at, updated_at
       )
       SELECT
         ?,
@@ -1167,7 +1964,7 @@ async function createTask(env, input, actor) {
         ?, ?, ?, ?,
         ?, ?,
         ?, ?, ?, ?,
-        NULL, 1, ?, ?, ?
+        NULL, 1, ?, ?
       FROM projects
       WHERE projects.id = ?
     `).bind(
@@ -1198,7 +1995,6 @@ async function createTask(env, input, actor) {
       input.recurrence?.unit ?? null,
       timestamp,
       timestamp,
-      input.agentSession ? JSON.stringify(input.agentSession) : null,
       input.projectId,
     ),
     env.DB.prepare(`
@@ -1252,6 +2048,64 @@ async function createTask(env, input, actor) {
     );
   }
   return getTask(env, id);
+}
+
+async function upsertIntegrationTask(env, input, actor) {
+  const project = await env.DB.prepare(`SELECT projects.id, projects.name,
+    (SELECT tasks.identifier FROM tasks WHERE tasks.project_id = projects.id ORDER BY tasks.created_at, tasks.id LIMIT 1) AS first_identifier
+    FROM projects WHERE projects.id = ?`).bind(input.projectId).first();
+  if (!project) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
+  const existing = await env.DB.prepare("SELECT * FROM tasks WHERE external_origin = ? AND external_key = ?").bind(input.externalOrigin, input.externalKey).first();
+  const timestamp = now();
+  if (existing) {
+    if (existing.project_id !== input.projectId) throw new ApiError(409, "EXTERNAL_IDENTITY_CONFLICT", `External identity '${input.externalKey}' is already linked to project '${existing.project_id}'`);
+    const current = taskFromRow(existing);
+    const changed = current.title !== input.title || current.description !== input.description || current.status !== input.status || current.priority !== input.priority || JSON.stringify(current.labels) !== JSON.stringify(input.labels) || existing.external_url !== input.externalUrl || existing.archived_at !== null;
+    if (changed) {
+      let sortOrder = existing.sort_order;
+      if (current.status !== input.status) {
+        const placement = await env.DB.prepare("SELECT MIN(sort_order) AS minimum FROM tasks WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?").bind(input.projectId, input.status, existing.id).first();
+        sortOrder = placement?.minimum == null ? 1000 : Number(placement.minimum) - 1000;
+      }
+      await env.DB.prepare("UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?, labels = ?, sort_order = ?, external_url = ?, archived_at = NULL, version = version + 1, updated_at = ? WHERE id = ?").bind(input.title, input.description, input.status, input.priority, JSON.stringify(input.labels), sortOrder, input.externalUrl, timestamp, existing.id).run();
+    }
+    return { task: await getTask(env, existing.id), created: false };
+  }
+  const prefix = projectPrefix(project);
+  const suffixStart = prefix.length + 2;
+  const maxRow = await env.DB.prepare("SELECT MAX(CAST(substr(identifier, ?) AS INTEGER)) AS maximum FROM tasks WHERE identifier GLOB ?").bind(suffixStart, `${prefix}-[0-9]*`).first();
+  const identifier = `${prefix}-${Math.max(Number(maxRow?.maximum ?? 0) + 1, 1)}`;
+  const id = uuid();
+  const placement = await env.DB.prepare("SELECT MIN(sort_order) AS minimum FROM tasks WHERE project_id = ? AND status = ? AND archived_at IS NULL").bind(input.projectId, input.status).first();
+  const sortOrder = placement?.minimum == null ? 1000 : Number(placement.minimum) - 1000;
+  await env.DB.prepare(`INSERT INTO tasks (id, identifier, project_id, title, description, status, priority, labels, sort_order, creator_type, creator_id, creator_name, creator_avatar_url, assignee_type, assignee_id, assignee_name, assignee_avatar_url, external_source, external_origin, external_id, external_key, external_url, archived_at, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'integration', ?, ?, ?, ?, NULL, 1, ?, ?)`).bind(id, identifier, input.projectId, input.title, input.description, input.status, input.priority, JSON.stringify(input.labels), sortOrder, actor.type, actor.id, actor.name, actor.avatarUrl, actor.type, actor.id, actor.name, actor.avatarUrl, input.externalOrigin, input.externalKey, input.externalKey, input.externalUrl, timestamp, timestamp).run();
+  return { task: await getTask(env, id), created: true };
+}
+
+async function adoptLegacyIntegrationTask(env, input) {
+  const [legacy, duplicate] = await Promise.all([
+    requireTaskRow(env, input.legacyTaskId),
+    requireTaskRow(env, input.duplicateTaskId),
+  ]);
+  if (
+    legacy.project_id !== input.projectId
+    || duplicate.project_id !== input.projectId
+    || duplicate.external_origin !== input.externalOrigin
+    || duplicate.external_key !== input.externalKey
+  ) {
+    throw new ApiError(409, "INTEGRATION_ADOPTION_CONFLICT", "The selected legacy or duplicate task no longer matches this integration identity");
+  }
+  if (legacy.external_origin || legacy.external_key) {
+    throw new ApiError(409, "INTEGRATION_ADOPTION_CONFLICT", "The legacy task already has an external identity");
+  }
+  const timestamp = now();
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE tasks SET external_source = NULL, external_origin = NULL, external_id = NULL, external_key = NULL, external_url = NULL, archived_at = ?, version = version + 1, updated_at = ? WHERE id = ?`)
+      .bind(timestamp, timestamp, duplicate.id),
+    env.DB.prepare(`UPDATE tasks SET external_source = 'integration', external_origin = ?, external_id = ?, external_key = ?, external_url = ?, version = version + 1, updated_at = ? WHERE id = ?`)
+      .bind(input.externalOrigin, input.externalKey, input.externalKey, duplicate.external_url, timestamp, legacy.id),
+  ]);
+  return { task: await getTask(env, legacy.id) };
 }
 
 async function updateTask(env, id, input, actor) {
@@ -1350,10 +2204,6 @@ async function updateTask(env, id, input, actor) {
     );
     values.push(...storedBinding);
   }
-  if (input.agentSession !== undefined) {
-    assignments.push("agent_session = ?");
-    values.push(input.agentSession ? JSON.stringify(input.agentSession) : null);
-  }
   assignments.push("version = version + 1", "updated_at = ?");
   const timestamp = now();
   values.push(timestamp, current.id, input.version);
@@ -1366,17 +2216,6 @@ async function updateTask(env, id, input, actor) {
     SET ${assignments.join(", ")}
     WHERE id = ? AND version = ?${relationGuard}
   `).bind(...values)];
-  if (Object.hasOwn(input.changes, "description")) {
-    // Keep this immediately after the body UPDATE: changes() must describe that
-    // statement, including its version/relation guard, not a later batch write.
-    statements.push(env.DB.prepare(`
-      UPDATE attachments
-      SET body_fallback = 0,
-        change_revision = (SELECT revision + 1 FROM global_revision WHERE singleton = 1)
-      WHERE task_id = ? AND comment_id IS NULL AND body_fallback = 1
-        AND changes() = 1
-    `).bind(current.id));
-  }
   const activityChanges = taskFieldChanges(currentTask, activityValues);
   if (activityChanges.length > 0) {
     statements.push(taskActivityStatement(
@@ -1510,8 +2349,6 @@ async function moveTask(env, id, input, actor) {
   }
   const timestamp = now();
   const storedBinding = storedThreadBindingForExisting(current, input.threadBinding, input.threadId);
-  const sessionAssignment = input.agentSession === undefined ? "" : "agent_session = ?,";
-  const sessionValues = input.agentSession === undefined ? [] : [input.agentSession ? JSON.stringify(input.agentSession) : null];
   const threadAssignment = storedBinding
     ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
       thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -1521,14 +2358,14 @@ async function moveTask(env, id, input, actor) {
     SET
       status = ?,
       sort_order = ?,
-      ${threadAssignment}${sessionAssignment}
+      ${threadAssignment}
       version = version + 1,
       updated_at = ?
     WHERE id = ? AND version = ?
   `).bind(
     input.status,
     sortOrder,
-    ...(storedBinding ?? []), ...sessionValues,
+    ...(storedBinding ?? []),
     timestamp,
     current.id,
     input.version,
@@ -1562,8 +2399,6 @@ async function archiveTask(env, id, input, actor) {
   assertTaskVersion(current, input.version);
   const timestamp = now();
   const storedBinding = storedThreadBindingForExisting(current, input.threadBinding, input.threadId);
-  const sessionAssignment = input.agentSession === undefined ? "" : "agent_session = ?,";
-  const sessionValues = input.agentSession === undefined ? [] : [input.agentSession ? JSON.stringify(input.agentSession) : null];
   const threadAssignment = storedBinding
     ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
       thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -1572,11 +2407,11 @@ async function archiveTask(env, id, input, actor) {
     UPDATE tasks
     SET
       archived_at = ?,
-      ${threadAssignment}${sessionAssignment}
+      ${threadAssignment}
       version = version + 1,
       updated_at = ?
     WHERE id = ? AND version = ?
-  `).bind(timestamp, ...(storedBinding ?? []), ...sessionValues, timestamp, current.id, input.version),
+  `).bind(timestamp, ...(storedBinding ?? []), timestamp, current.id, input.version),
   taskActivityStatement(
     env,
     current.id,
@@ -1605,8 +2440,6 @@ async function restoreTask(env, id, input, actor) {
   }
   const timestamp = now();
   const storedBinding = storedThreadBindingForExisting(current, input.threadBinding, input.threadId);
-  const sessionAssignment = input.agentSession === undefined ? "" : "agent_session = ?,";
-  const sessionValues = input.agentSession === undefined ? [] : [input.agentSession ? JSON.stringify(input.agentSession) : null];
   const threadAssignment = storedBinding
     ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
       thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -1615,11 +2448,11 @@ async function restoreTask(env, id, input, actor) {
     UPDATE tasks
     SET
       archived_at = NULL,
-      ${threadAssignment}${sessionAssignment}
+      ${threadAssignment}
       version = version + 1,
       updated_at = ?
     WHERE id = ? AND version = ?
-  `).bind(...(storedBinding ?? []), ...sessionValues, timestamp, current.id, input.version),
+  `).bind(...(storedBinding ?? []), timestamp, current.id, input.version),
   taskActivityStatement(
     env,
     current.id,
@@ -1722,8 +2555,6 @@ async function addRelation(env, taskId, type, relatedTaskId, input, actor) {
   const endpoints = relationEndpoints(type, task.id, relatedTask.id);
   const timestamp = now();
   const storedBinding = storedThreadBindingForExisting(task, input.threadBinding, input.threadId);
-  const sessionAssignment = input.agentSession === undefined ? "" : "agent_session = ?,";
-  const sessionValues = input.agentSession === undefined ? [] : [input.agentSession ? JSON.stringify(input.agentSession) : null];
   const threadAssignment = storedBinding
     ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
       thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -1804,11 +2635,11 @@ async function addRelation(env, taskId, type, relatedTaskId, input, actor) {
     env.DB.prepare(`
       UPDATE tasks
       SET
-        ${threadAssignment}${sessionAssignment}
+        ${threadAssignment}
         version = version + 1,
         updated_at = ?
       WHERE id = ? AND version = ?
-    `).bind(...(storedBinding ?? []), ...sessionValues, timestamp, task.id, input.version),
+    `).bind(...(storedBinding ?? []), timestamp, task.id, input.version),
   );
   const taskUpdateIndex = statements.length - 1;
   statements.push(taskActivityStatement(
@@ -1889,8 +2720,6 @@ async function removeRelation(env, taskId, type, relatedTaskId, input, actor) {
   }
   const timestamp = now();
   const storedBinding = storedThreadBindingForExisting(task, input.threadBinding, input.threadId);
-  const sessionAssignment = input.agentSession === undefined ? "" : "agent_session = ?,";
-  const sessionValues = input.agentSession === undefined ? [] : [input.agentSession ? JSON.stringify(input.agentSession) : null];
   const threadAssignment = storedBinding
     ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
       thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -1962,11 +2791,11 @@ async function removeRelation(env, taskId, type, relatedTaskId, input, actor) {
     env.DB.prepare(`
       UPDATE tasks
       SET
-        ${threadAssignment}${sessionAssignment}
+        ${threadAssignment}
         version = version + 1,
         updated_at = ?
       WHERE id = ? AND version = ?${mentionRemoval ? " AND changes() = 1" : ""}
-    `).bind(...(storedBinding ?? []), ...sessionValues, timestamp, task.id, input.version),
+    `).bind(...(storedBinding ?? []), timestamp, task.id, input.version),
     taskActivityStatement(
       env,
       task.id,
@@ -2114,7 +2943,7 @@ async function listComments(env, taskId) {
     ORDER BY created_at, id
   `).bind(task.id));
   return {
-    comments: await hydrateComments(env, rows),
+    comments: await Promise.all(rows.map((row) => hydrateComment(env, row))),
     nextCursor: nextCursor(rows, null),
   };
 }
@@ -2128,7 +2957,7 @@ async function listCommentsAfter(env, taskId, after) {
     ORDER BY change_revision
   `).bind(task.id, after.revision));
   return {
-    comments: await hydrateComments(env, rows),
+    comments: await Promise.all(rows.map((row) => hydrateComment(env, row))),
     nextCursor: nextCursor(rows, after),
   };
 }
@@ -2141,9 +2970,9 @@ async function createComment(env, taskId, input, actor) {
     INSERT INTO comments (
       id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
       thread_codex_host_id, thread_workspace_path, author_type, author_id, author_name,
-      author_avatar_url, version, created_at, updated_at, change_revision, agent_session
+      author_avatar_url, version, created_at, updated_at, change_revision
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?,
-      (SELECT revision + 1 FROM global_revision WHERE singleton = 1), ?)
+      (SELECT revision + 1 FROM global_revision WHERE singleton = 1))
   `).bind(
     id,
     task.id,
@@ -2155,7 +2984,6 @@ async function createComment(env, taskId, input, actor) {
     actor.avatarUrl,
     timestamp,
     timestamp,
-    input.agentSession ? JSON.stringify(input.agentSession) : null,
   ).run();
   const row = await env.DB.prepare("SELECT * FROM comments WHERE id = ?").bind(id).first();
   return hydrateComment(env, row);
@@ -2184,33 +3012,26 @@ async function updateComment(env, id, input) {
   const current = await requireCommentRow(env, id);
   assertCommentVersion(current, input.version);
   const storedBinding = storedThreadBinding(input.threadBinding, input.threadId);
-  const sessionAssignment = input.agentSession === undefined ? "" : "agent_session = ?,";
-  const sessionValues = input.agentSession === undefined ? [] : [input.agentSession ? JSON.stringify(input.agentSession) : null];
   const threadAssignment = storedBinding
     ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
       thread_codex_host_id = ?, thread_workspace_path = ?,`
     : "";
-  const [result] = await env.DB.batch([env.DB.prepare(`
+  const result = await env.DB.prepare(`
     UPDATE comments
     SET
       body = ?,
-      ${threadAssignment}${sessionAssignment}
+      ${threadAssignment}
       version = version + 1,
       updated_at = ?,
       change_revision = (SELECT revision + 1 FROM global_revision WHERE singleton = 1)
     WHERE id = ? AND version = ?
   `).bind(
     input.body,
-    ...(storedBinding ?? []), ...sessionValues,
+    ...(storedBinding ?? []),
     now(),
     current.id,
     input.version,
-  ), env.DB.prepare(`
-    UPDATE attachments
-    SET body_fallback = 0,
-      change_revision = (SELECT revision + 1 FROM global_revision WHERE singleton = 1)
-    WHERE comment_id = ? AND body_fallback = 1 AND changes() = 1
-  `).bind(current.id)]);
+  ).run();
   if (!changed(result)) {
     const latest = await requireCommentRow(env, current.id);
     throw new ApiError(
@@ -2440,10 +3261,7 @@ async function attachmentContent(env, id, request, download = false) {
     /['()*]/g,
     (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
   );
-  const canOpenInline = !download && (
-    INLINE_ATTACHMENT_TYPES.has(attachment.contentType)
-    || attachment.contentType.startsWith("video/")
-  );
+  const canOpenInline = !download && INLINE_ATTACHMENT_TYPES.has(attachment.contentType);
   return new Response(request.method === "HEAD" ? null : object.body, {
     status: 200,
     headers: {
@@ -2463,6 +3281,11 @@ async function attachmentContent(env, id, request, download = false) {
 async function routeApi(request, env, actor, url) {
   const { pathname } = url;
 
+  if (pathname.startsWith("/api/sync") || pathname.startsWith("/api/admin/clients")) {
+    const syncResponse = await handleSyncApi(request, env, url);
+    if (syncResponse) return syncResponse;
+  }
+
   if (pathname === "/api/meta") {
     if (request.method !== "GET") methodNotAllowed(["GET"]);
     requireNoQuery(url, "GET /api/meta");
@@ -2470,35 +3293,11 @@ async function routeApi(request, env, actor, url) {
       mode: "cloud",
       manageTaskboardSkillPath: null,
       realtime: {
-        transport: "websocket",
-        endpoint: "/api/events",
+        transport: "poll",
+        intervalMs: 2_000,
       },
       localCapabilities: { available: false },
     });
-  }
-
-  if (pathname === "/api/client-storage") {
-    requireNoQuery(url, "/api/client-storage");
-    if (request.method === "GET") {
-      return realtimeHub(env).fetch("https://realtime.internal/client-storage");
-    }
-    if (request.method === "PATCH") {
-      const update = parseClientStorageUpdate(await readJson(request));
-      const response = await realtimeHub(env).fetch(
-        "https://realtime.internal/client-storage",
-        {
-          method: "PATCH",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(update),
-        },
-      );
-      if (!response.ok) return response;
-      await env.DB.prepare(`
-        UPDATE global_revision SET revision = revision + 1 WHERE singleton = 1
-      `).run();
-      return response;
-    }
-    methodNotAllowed(["GET", "PATCH"]);
   }
 
   if (pathname === "/api/revisions") {
@@ -2623,11 +3422,23 @@ async function routeApi(request, env, actor, url) {
       return json(200, { readme: await getProjectReadme(env, projectId) });
     }
     if (request.method === "PUT") {
-      const { content, version } = parseProjectReadmeSave(await readJson(
+      const body = await readJson(
         request,
         PROJECT_README_BODY_LIMIT,
         "Project README request cannot exceed 3 MiB",
-      ));
+      );
+      assertPlainObject(body);
+      assertAllowedKeys(body, new Set(["version", "content"]));
+      const version = body.version === undefined
+        ? undefined
+        : parseVersion(body.version, { allowZero: true });
+      const content = body.content ?? "";
+      if (typeof content !== "string") {
+        throw new ApiError(400, "INVALID_FIELD", "'content' must be a string");
+      }
+      if (content.length > 500_000) {
+        throw new ApiError(400, "INVALID_FIELD", "'content' cannot exceed 500000 characters");
+      }
       return json(200, {
         readme: await saveProjectReadme(env, projectId, content, version),
       });
@@ -2643,10 +3454,26 @@ async function routeApi(request, env, actor, url) {
     }
     if (request.method === "POST") {
       return json(201, {
-        task: await createTask(env, parseTaskCreate(await readJson(request), parseDevelopmentContext), actor),
+        task: await createTask(env, parseTaskCreate(await readJson(request)), actor),
       });
     }
     methodNotAllowed(["GET", "POST"]);
+  }
+
+  if (pathname === "/api/integrations/tasks/upsert") {
+    if (request.method !== "POST") methodNotAllowed(["POST"]);
+    requireNoQuery(url, "POST /api/integrations/tasks/upsert");
+    const result = await upsertIntegrationTask(env, parseIntegrationTaskUpsert(await readJson(request)), actor);
+    return json(result.created ? 201 : 200, { task: result.task });
+  }
+
+  if (pathname === "/api/integrations/tasks/adopt") {
+    if (request.method !== "POST") methodNotAllowed(["POST"]);
+    requireNoQuery(url, "POST /api/integrations/tasks/adopt");
+    return json(200, await adoptLegacyIntegrationTask(
+      env,
+      parseIntegrationTaskAdopt(await readJson(request)),
+    ));
   }
 
   const taskTreeMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/tree$/);
@@ -2810,7 +3637,7 @@ async function routeApi(request, env, actor, url) {
         task: await updateTask(
           env,
           taskId,
-          parseTaskPatch(await readJson(request), parseDevelopmentContext),
+          parseTaskPatch(await readJson(request)),
           actor,
         ),
       });
@@ -2868,13 +3695,25 @@ export default {
         return withSecurityHeaders(json(200, { status: "ok" }));
       }
 
+      const oauthResponse = await routeOAuth(request, env, url);
+      if (oauthResponse) return withSecurityHeaders(oauthResponse);
+      const mcpResponse = await routeMcp(request, env, url, routeApi);
+      if (mcpResponse) return withSecurityHeaders(mcpResponse);
+      if (url.pathname === "/conflicts") {
+        const conflictsAuthentication = await authenticate(request, env);
+        if (!conflictsAuthentication) return withSecurityHeaders(unauthorized());
+        return withSecurityHeaders(await handleSyncApi(request, env, url));
+      }
+      const loginResponse = await routeBrowserLogin(request, env, url);
+      if (loginResponse) return withSecurityHeaders(loginResponse);
+
       const authentication = await authenticate(request, env);
       if (!authentication) return withSecurityHeaders(unauthorized());
 
       let response = url.pathname.startsWith("/api/")
         ? await routeApi(request, env, authentication.actor, url)
         : env.ASSETS
-          ? await env.ASSETS.fetch(request)
+          ? await fetchApplicationAsset(request, env.ASSETS)
           : json(404, { error: { code: "NOT_FOUND", message: "Resource not found" } });
       if (authentication.sessionCookie && response.status !== 101) {
         response = new Response(response.body, response);

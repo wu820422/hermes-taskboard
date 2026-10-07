@@ -165,10 +165,6 @@ export interface ComposerCandidatesQuery {
   surface?: ComposerSurface;
   trigger: ComposerTrigger;
   query: string;
-  codexProjectId?: string;
-  codexProjectKind?: "local" | "remote";
-  codexHostId?: string;
-  workspacePath?: string;
 }
 
 export interface ComposerCandidatesResponse {
@@ -269,9 +265,6 @@ export interface AiChatOrigin {
   projectId: string;
   projectName: string;
   workspacePath: string;
-  codexProjectId?: string;
-  codexProjectKind?: "local" | "remote";
-  codexHostId?: string;
   issueId?: string;
   issueIdentifier?: string;
 }
@@ -319,13 +312,10 @@ export interface AiChatEvent {
   createdAt?: string;
 }
 
-export interface AiChatThreadSummary {
+export interface AiChatThreadSnapshot {
   thread: AiChatThread;
-  runs: AiChatRun[];
-}
-
-export interface AiChatThreadSnapshot extends AiChatThreadSummary {
   events: AiChatEvent[];
+  runs: AiChatRun[];
 }
 
 export interface CodexProjectIdentity {
@@ -343,6 +333,7 @@ export interface Project {
   id: string;
   name: string;
   workspacePath: string | null;
+  startDate: string | null;
   source: "local" | "jira";
   labels: string[];
   issueCount: number;
@@ -396,13 +387,6 @@ export interface TaskRelations {
   related: TaskRelationSummary[];
 }
 
-export type AgentPlatform = "claude" | "pi" | "agy" | "grok";
-
-export interface AgentSession {
-  platform: AgentPlatform;
-  sessionId: string;
-}
-
 interface TaskConversationRefBase {
   source: "task" | "comment";
   sourceId: string;
@@ -411,9 +395,8 @@ interface TaskConversationRefBase {
 }
 
 export type TaskConversationRef = TaskConversationRefBase & (
-  | (CodexThreadBinding & { legacyLocal?: false; agentSession?: undefined })
-  | { threadId: string; legacyLocal: true; agentSession?: undefined }
-  | { agentSession: AgentSession }
+  | (CodexThreadBinding & { legacyLocal?: false })
+  | { threadId: string; legacyLocal: true }
 );
 
 export interface Task {
@@ -429,7 +412,6 @@ export interface Task {
   threadId: string | null;
   threadBinding: CodexThreadBinding | null;
   legacyLocalThreadId: string | null;
-  agentSession?: AgentSession | null;
   conversationRefs: TaskConversationRef[];
   participants: ActorIdentity[];
   previewImage: Attachment | null;
@@ -477,11 +459,23 @@ export interface Comment {
   threadId: string | null;
   threadBinding: CodexThreadBinding | null;
   legacyLocalThreadId: string | null;
-  agentSession?: AgentSession | null;
   attachments: Attachment[];
+  agentDispatch?: CommentAgentDispatch | null;
   version: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CommentAgentDispatch {
+  status: "pending" | "running" | "completed" | "failed";
+  threadId: string | null;
+  runId: string | null;
+  attempts: number;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
 }
 
 export interface TaskActivityChange {
@@ -506,7 +500,6 @@ export interface Attachment {
   taskId: string;
   commentId: string | null;
   kind: "inline" | "attachment";
-  bodyFallback: boolean;
   filename: string;
   contentType: string;
   size: number;
@@ -547,4 +540,15 @@ export interface TaskDraft {
   startDate: string | null;
   dueDate: string | null;
   recurrence: Recurrence | null;
+}
+
+export interface TaskEvent {
+  type: string;
+  projectId?: string;
+  taskId?: string;
+  task?: Task;
+  comment?: Comment;
+  attachment?: Attachment;
+  project?: Project;
+  at: string;
 }

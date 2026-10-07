@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const CONFIG_VERSION = 1;
@@ -119,19 +119,57 @@ export function createCloudConfigStore({ configPath }) {
   let pendingWrite = Promise.resolve();
 
   async function readFromDisk() {
+    let raw;
     try {
-      return parseConfig(JSON.parse(await readFile(configPath, "utf8")));
+      raw = JSON.parse(await readFile(configPath, "utf8"));
     } catch (error) {
       if (error?.code === "ENOENT") return emptyConfig();
+      throw error;
+    }
+    let sharedKey = await readSecrets();
+    if (!sharedKey && raw.sharedKey) {
+      sharedKey = raw.sharedKey;
+      await writeSecrets(sharedKey);
+      raw = { ...raw, sharedKey: null };
+      const temporaryPath = `${configPath}.${process.pid}.${Date.now()}.migrate.tmp`;
+      await writeFile(temporaryPath, `${JSON.stringify(raw, null, 2)}\n`, { mode: 0o600 });
+      await rename(temporaryPath, configPath);
+      await chmod(configPath, 0o600);
+    }
+    return parseConfig({ ...raw, sharedKey });
+  }
+
+  function secretsPath() {
+    return `${configPath}.secrets`;
+  }
+
+  async function writeSecrets(sharedKey) {
+    await mkdir(path.dirname(configPath), { recursive: true });
+    const temporaryPath = `${secretsPath()}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(temporaryPath, `${JSON.stringify({ sharedKey: sharedKey ?? null }, null, 2)}\n`, { mode: 0o600 });
+    await rename(temporaryPath, secretsPath());
+    await chmod(secretsPath(), 0o600);
+  }
+
+  async function readSecrets() {
+    if (process.env.TASKBOARD_SHARED_KEY) return process.env.TASKBOARD_SHARED_KEY;
+    try {
+      const parsed = JSON.parse(await readFile(secretsPath(), "utf8"));
+      return parsed.sharedKey ?? null;
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
       throw error;
     }
   }
 
   async function writeAtomically(config) {
     await mkdir(path.dirname(configPath), { recursive: true });
+    const publicConfig = { ...config, sharedKey: null };
     const temporaryPath = `${configPath}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(temporaryPath, `${JSON.stringify(publicConfig, null, 2)}\n`, { mode: 0o600 });
     await rename(temporaryPath, configPath);
+    await chmod(configPath, 0o600);
+    await writeSecrets(config.sharedKey ?? null);
   }
 
   function update(mutator) {

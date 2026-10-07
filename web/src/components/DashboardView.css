@@ -63,6 +63,20 @@
   line-height: 41.4px;
 }
 
+.dashboard-view .dashboard-project-start {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.dashboard-view .dashboard-project-start strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
 .dashboard-view .dashboard-hero-value {
   display: flex;
   align-items: baseline;

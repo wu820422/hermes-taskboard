@@ -1,4 +1,3 @@
-import { listenForOutsidePointerDown } from "../menuEvents";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { labelDisplayName, labelPresentation } from "../labels";
 import { useTaskboardI18n } from "../i18n";
@@ -61,7 +60,9 @@ export function LabelPicker({
       return;
     }
 
-    const stopOutside = listenForOutsidePointerDown([rootRef], () => onOpenChange(false));
+    function closeFromOutside(event: PointerEvent) {
+      if (!rootRef.current?.contains(event.target as Node)) onOpenChange(false);
+    }
 
     function closeFromEscape(event: globalThis.KeyboardEvent) {
       if (event.key === "Escape") {
@@ -70,9 +71,10 @@ export function LabelPicker({
       }
     }
 
+    document.addEventListener("pointerdown", closeFromOutside);
     window.addEventListener("keydown", closeFromEscape);
     return () => {
-      stopOutside();
+      document.removeEventListener("pointerdown", closeFromOutside);
       window.removeEventListener("keydown", closeFromEscape);
     };
   }, [onOpenChange, open]);

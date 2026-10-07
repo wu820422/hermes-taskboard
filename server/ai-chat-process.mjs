@@ -2,7 +2,6 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
-import { resolveCodexPermissions } from "../shared/codex-permissions.mjs";
 import { signalProcessTree } from "../shared/process-tree.mjs";
 
 const VISIBLE_TEXT_LIMIT = 65_536;
@@ -165,12 +164,31 @@ function normalizedItem(rawType, item) {
 }
 
 export function buildCodexArgs(thread, addDirectories, imagePaths = []) {
-  const permission = resolveCodexPermissions(thread.sandbox);
+  const permission = thread.sandbox === "read-only"
+    ? {
+        sandbox: "workspace-write",
+        approvalPolicy: "on-request",
+        reviewer: "user",
+      }
+    : thread.sandbox === "workspace-write"
+      ? {
+          sandbox: "workspace-write",
+          approvalPolicy: "on-request",
+          reviewer: "auto_review",
+        }
+      : {
+          sandbox: "danger-full-access",
+          approvalPolicy: "never",
+          reviewer: null,
+        };
   const args = [
     "exec",
     "--json",
     "--color",
     "never",
+    // Project workspaces may be Drive-backed case/material folders rather than Git repositories.
+    // Codex otherwise rejects those directories before it can consume a Taskboard comment.
+    "--skip-git-repo-check",
     "-C",
     thread.origin.workspacePath,
     "-s",

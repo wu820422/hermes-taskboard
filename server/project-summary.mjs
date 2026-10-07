@@ -1,6 +1,6 @@
 import { signalProcessTree } from "../shared/process-tree.mjs";
 import { spawnCodexTurn } from "./ai-chat-process.mjs";
-import { ApiError } from "../shared/api-fields.mjs";
+import { ApiError } from "./database.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const CHECK_INTERVAL_MS = 60 * 60 * 1_000;

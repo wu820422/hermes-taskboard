@@ -1,5 +1,6 @@
 import { useState, type KeyboardEvent, type MouseEvent, type RefObject } from "react";
 import { assigneeTargetForActor } from "../actors";
+import { taskDisplayIdentifier } from "../taskDisplayIdentifier";
 import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
 import { labelPresentation } from "../labels";
 import type { TaskCardPresentation } from "../taskConversations";
@@ -10,7 +11,10 @@ import { DueDateIcon, PriorityIcon, StatusIcon } from "./SemanticIcons";
 import { TaskConversationMenu } from "./TaskConversationMenu";
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
 
-const COLLAPSED_BY_DEFAULT = new Set<TaskStatus>(["backlog", "done", "canceled"]);
+// Source-backed projects must show every imported row immediately. Keep only
+// the canceled bucket collapsed by default; completed and backlog rows are
+// real work records and must not look missing.
+const COLLAPSED_BY_DEFAULT = new Set<TaskStatus>(["canceled"]);
 
 interface IssueListViewProps {
   scrollRef: RefObject<HTMLDivElement | null>;
@@ -78,7 +82,7 @@ export function IssueListView({
                 <div className="issue-list-rows">
                   {statusTasks.length ? statusTasks.map((task) => {
                     const assigneeTarget = assigneeTargetForActor(task.assignee, currentUser) ?? "current-user";
-                    const displayIdentifier = task.externalKey ?? task.identifier;
+                    const displayIdentifier = taskDisplayIdentifier(task);
                     return (
                       <div
                         className={`issue-list-row${presentations[task.id]?.unread ? " is-unread" : ""}`}

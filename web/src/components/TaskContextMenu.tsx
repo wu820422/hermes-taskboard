@@ -1,4 +1,3 @@
-import { listenForOutsidePointerDown, listenForMenuViewportChange } from "../menuEvents";
 import {
   useEffect,
   useLayoutEffect,
@@ -183,13 +182,24 @@ export function TaskContextMenu({
     const previousFocus = document.activeElement as HTMLElement | null;
     requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(".context-menu-item:not(:disabled)")?.focus());
 
-    const stopOutside = listenForOutsidePointerDown([menuRef], onClose);
-    const stopViewport = listenForMenuViewportChange(menuRef, onClose);
+    function closeFromOutside(event: PointerEvent) {
+      if (!menuRef.current?.contains(event.target as Node)) onClose();
+    }
+    function closeFromViewportChange(event: Event) {
+      if (event.type === "scroll" && menuRef.current?.contains(event.target as Node)) return;
+      onClose();
+    }
 
+    document.addEventListener("pointerdown", closeFromOutside);
+    window.addEventListener("blur", closeFromViewportChange);
+    window.addEventListener("resize", closeFromViewportChange);
+    window.addEventListener("scroll", closeFromViewportChange, true);
     return () => {
       if (submenuTimerRef.current !== null) window.clearTimeout(submenuTimerRef.current);
-      stopOutside();
-      stopViewport();
+      document.removeEventListener("pointerdown", closeFromOutside);
+      window.removeEventListener("blur", closeFromViewportChange);
+      window.removeEventListener("resize", closeFromViewportChange);
+      window.removeEventListener("scroll", closeFromViewportChange, true);
       previousFocus?.focus?.({ preventScroll: true });
     };
   }, [onClose]);

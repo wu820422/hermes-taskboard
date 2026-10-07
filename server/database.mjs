@@ -1,30 +1,90 @@
-import { ApiError } from "../shared/api-fields.mjs";
-import { taskRelationsQuery, taskRelationsFromRows } from "../shared/task-relations.mjs";
-import {
-  commentConversationTitle,
-  agentSessionFromRow,
-  threadBindingFromRow,
-  legacyLocalThreadIdFromRow,
-  storedThreadBinding,
-  attachTaskActivity,
-  taskActivityFromRow,
-  taskFieldChanges,
-  taskTreeNode,
-  projectReadmeAttachmentFromRow,
-  projectPrefix,
-} from "../shared/task-records.mjs";
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import {
+  allocateIdentifierSync,
+  assignProjectPrefixSync,
+  bindAllocation,
+  v2IdentifiersEnabled,
+} from "../shared/sync/allocate.mjs";
+import { ensureLocalSyncSchema } from "../shared/sync/schema.mjs";
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const TASK_TREE_MAX_NODES = 1_000;
 
+export class ApiError extends Error {
+  constructor(status, code, message, details) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
+
 function now() {
   return new Date().toISOString();
+}
+
+function projectStartDateFromIdentity(id, createdAt = null) {
+  const match = String(id ?? "").match(/^(\d{4})-(\d{2})(?:-(\d{2}))?(?:-|$)/);
+  if (match) return `${match[1]}-${match[2]}-${match[3] ?? "01"}`;
+  if (id === "local") return null;
+  return createdAt ? String(createdAt).slice(0, 10) : null;
+}
+
+function commentConversationTitle(body) {
+  const firstLine = String(body ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  if (!firstLine) return "评论";
+  const compact = firstLine.replace(/\s+/g, " ");
+  return compact.length > 80 ? `${compact.slice(0, 77)}…` : compact;
+}
+
+function threadBindingFromRow(row) {
+  if (
+    !row.thread_id
+    || !row.thread_codex_project_id
+    || !row.thread_codex_project_kind
+    || !row.thread_codex_host_id
+    || !row.thread_workspace_path
+  ) return null;
+  return {
+    threadId: row.thread_id,
+    codexProjectId: row.thread_codex_project_id,
+    codexProjectKind: row.thread_codex_project_kind,
+    codexHostId: row.thread_codex_host_id,
+    workspacePath: row.thread_workspace_path,
+  };
+}
+
+function legacyLocalThreadIdFromRow(row) {
+  if (!row.thread_id) return null;
+  return [
+    row.thread_codex_project_id,
+    row.thread_codex_project_kind,
+    row.thread_codex_host_id,
+    row.thread_workspace_path,
+  ].every((value) => value == null)
+    ? row.thread_id
+    : null;
+}
+
+function storedThreadBinding(threadBinding, threadId) {
+  if (threadBinding === undefined && (threadId === undefined || threadId === null)) return undefined;
+  const binding = threadBinding === undefined ? { threadId } : threadBinding;
+  return [
+    binding?.threadId ?? null,
+    binding?.codexProjectId ?? null,
+    binding?.codexProjectKind ?? null,
+    binding?.codexHostId ?? null,
+    binding?.workspacePath ?? null,
+  ];
 }
 
 function storedThreadBindingForExisting(current, threadBinding, threadId) {
@@ -36,6 +96,118 @@ function storedThreadBindingForExisting(current, threadBinding, threadId) {
     return storedThreadBinding(current.threadBinding, threadId);
   }
   return storedThreadBinding(threadBinding, threadId);
+}
+
+function attachTaskActivity(task, comments, activities, previewImage = null) {
+  const orderedComments = [...comments].sort((left, right) => (
+    left.id.localeCompare(right.id)
+  ));
+  const orderedActivities = [...activities].sort((left, right) => (
+    left.id.localeCompare(right.id)
+  ));
+  const participants = [];
+  const participantIds = new Set();
+  const addParticipant = (actor) => {
+    const key = `${actor.type}:${actor.id}`;
+    if (participantIds.has(key)) return;
+    participantIds.add(key);
+    participants.push(actor);
+  };
+  addParticipant({
+    type: task.creatorType,
+    id: task.creatorId,
+    name: task.creatorName,
+    avatarUrl: task.creatorAvatarUrl,
+  });
+  addParticipant(task.assignee);
+  for (const comment of orderedComments) {
+    addParticipant({
+      type: comment.author_type,
+      id: comment.author_id,
+      name: comment.author_name,
+      avatarUrl: comment.author_avatar_url,
+    });
+  }
+  for (const activity of orderedActivities) {
+    addParticipant({
+      type: activity.actor_type,
+      id: activity.actor_id,
+      name: activity.actor_name,
+      avatarUrl: activity.actor_avatar_url,
+    });
+  }
+  const conversationRefs = [];
+  if (task.threadBinding) {
+    conversationRefs.push({
+      ...task.threadBinding,
+      source: "task",
+      sourceId: task.id,
+      title: task.title,
+      updatedAt: task.updatedAt,
+    });
+  } else if (task.legacyLocalThreadId) {
+    conversationRefs.push({
+      threadId: task.legacyLocalThreadId,
+      legacyLocal: true,
+      source: "task",
+      sourceId: task.id,
+      title: task.title,
+      updatedAt: task.updatedAt,
+    });
+  }
+  for (const comment of orderedComments) {
+    const threadBinding = threadBindingFromRow(comment);
+    const legacyLocalThreadId = legacyLocalThreadIdFromRow(comment);
+    if (threadBinding || legacyLocalThreadId) {
+      conversationRefs.push({
+        ...(threadBinding ?? { threadId: legacyLocalThreadId, legacyLocal: true }),
+        source: "comment",
+        sourceId: comment.id,
+        title: commentConversationTitle(comment.body),
+        updatedAt: comment.updated_at,
+      });
+    }
+  }
+
+  task.conversationRefs = conversationRefs;
+  task.participants = participants;
+  task.previewImage = previewImage;
+  task.activityKey = JSON.stringify({
+    version: 1,
+    task: [task.id, task.version, task.updatedAt],
+    comments: orderedComments.map((comment) => [comment.id, comment.version, comment.updated_at]),
+    changes: orderedActivities.map((activity) => [activity.id, activity.created_at]),
+  });
+  task.activityUpdatedAt = [...orderedComments, ...orderedActivities].reduce(
+    (latest, activity) => {
+      const updatedAt = activity.updated_at ?? activity.created_at;
+      return updatedAt > latest ? updatedAt : latest;
+    },
+    task.updatedAt,
+  );
+  return task;
+}
+
+function taskActivityFromRow(row) {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    actorType: row.actor_type,
+    actorId: row.actor_id,
+    actorName: row.actor_name,
+    actorAvatarUrl: row.actor_avatar_url,
+    changes: JSON.parse(row.changes),
+    createdAt: row.created_at,
+  };
+}
+
+function taskFieldChanges(task, changes) {
+  return Object.entries(changes).flatMap(([field, after]) => {
+    const before = task[field];
+    return JSON.stringify(before) === JSON.stringify(after)
+      ? []
+      : [{ field, before, after }];
+  });
 }
 
 function relationActivityValue(type, task) {
@@ -86,7 +258,6 @@ function taskFromRow(row) {
     threadId: row.thread_id,
     threadBinding: threadBindingFromRow(row),
     legacyLocalThreadId: legacyLocalThreadIdFromRow(row),
-    agentSession: agentSessionFromRow(row),
     creatorType: row.creator_type,
     creatorId: row.creator_id,
     creatorName: row.creator_name,
@@ -104,6 +275,7 @@ function taskFromRow(row) {
       ? { interval: row.recurrence_interval, unit: row.recurrence_unit }
       : null,
     source: row.external_source === "jira" ? "jira" : "local",
+    externalSource: row.external_source ?? null,
     externalOrigin: row.external_origin ?? null,
     externalKey: row.external_key ?? null,
     externalUrl: row.external_url ?? null,
@@ -133,6 +305,22 @@ function taskRelationSummaryFromRow(row) {
   };
 }
 
+function taskTreeNode(row, parentId, depth, path) {
+  return {
+    id: row.id,
+    parentId,
+    depth,
+    path,
+    summary: {
+      identifier: row.identifier,
+      title: row.title,
+      status: row.status,
+      priority: row.priority,
+      archivedAt: row.archived_at,
+    },
+  };
+}
+
 function commentFromRow(row) {
   const comment = {
     id: row.id,
@@ -141,7 +329,6 @@ function commentFromRow(row) {
     threadId: row.thread_id,
     threadBinding: threadBindingFromRow(row),
     legacyLocalThreadId: legacyLocalThreadIdFromRow(row),
-    agentSession: agentSessionFromRow(row),
     authorType: row.author_type,
     authorId: row.author_id,
     authorName: row.author_name,
@@ -155,13 +342,27 @@ function commentFromRow(row) {
   return comment;
 }
 
+function commentAgentDispatchFromRow(row) {
+  if (!row) return null;
+  return {
+    status: row.status,
+    threadId: row.thread_id,
+    runId: row.run_id,
+    attempts: row.attempts,
+    error: row.error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+  };
+}
+
 function attachmentFromRow(row) {
   const attachment = {
     id: row.id,
     taskId: row.task_id,
     commentId: row.comment_id,
     kind: row.kind,
-    bodyFallback: row.body_fallback === 1,
     filename: row.filename,
     contentType: row.content_type,
     size: row.size,
@@ -176,6 +377,7 @@ function projectFromRow(row) {
     id: row.id,
     name: row.name,
     workspacePath: row.workspace_path,
+    startDate: row.start_date ?? null,
     source: row.id === JIRA_PROJECT_ID ? "jira" : "local",
     labels: JSON.parse(row.labels),
     issueCount: Number(row.issue_count ?? 0),
@@ -204,6 +406,18 @@ function projectReadmeFromRow(row, projectId) {
   };
 }
 
+function projectReadmeAttachmentFromRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    kind: "inline",
+    filename: row.filename,
+    contentType: row.content_type,
+    size: row.size,
+    createdAt: row.created_at,
+  };
+}
+
 function aiChatRunFromRow(row) {
   return {
     id: row.id,
@@ -225,9 +439,6 @@ function aiChatThreadFromRow(row) {
       projectId: row.origin_project_id,
       projectName: row.origin_project_name,
       workspacePath: row.origin_workspace_path,
-      ...(row.origin_codex_project_id ? { codexProjectId: row.origin_codex_project_id } : {}),
-      ...(row.origin_codex_project_kind ? { codexProjectKind: row.origin_codex_project_kind } : {}),
-      ...(row.origin_codex_host_id ? { codexHostId: row.origin_codex_host_id } : {}),
       ...(row.origin_issue_id ? { issueId: row.origin_issue_id } : {}),
       ...(row.origin_issue_identifier ? { issueIdentifier: row.origin_issue_identifier } : {}),
     },
@@ -255,6 +466,15 @@ function aiChatEventFromRow(row) {
   };
 }
 
+function projectPrefix(project) {
+  const idPrefix = project.id.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 12) || "TASK";
+  const existingPrefix = project.first_identifier?.replace(/-\d+$/, "");
+  if (existingPrefix && /^[A-Z0-9]+$/i.test(existingPrefix) && existingPrefix !== idPrefix) return existingPrefix;
+  if (idPrefix.length <= 5) return idPrefix;
+  const namePrefix = project.name.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 3);
+  return namePrefix || idPrefix.slice(0, 3);
+}
+
 export class TaskboardDatabase {
   constructor(filename) {
     mkdirSync(path.dirname(filename), { recursive: true });
@@ -270,6 +490,7 @@ export class TaskboardDatabase {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         workspace_path TEXT,
+        start_date TEXT,
         labels TEXT NOT NULL DEFAULT '${DEFAULT_PROJECT_LABELS_JSON}',
         next_task_number INTEGER NOT NULL DEFAULT 1 CHECK (next_task_number > 0),
         created_at TEXT NOT NULL,
@@ -344,6 +565,24 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS comments_task_created
         ON comments(task_id, created_at, id);
 
+      CREATE TABLE IF NOT EXISTS comment_agent_dispatches (
+        comment_id TEXT PRIMARY KEY REFERENCES comments(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+        thread_id TEXT,
+        run_id TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        next_attempt_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS comment_agent_dispatches_pending
+        ON comment_agent_dispatches(status, next_attempt_at, created_at, comment_id);
+
       CREATE TABLE IF NOT EXISTS task_activities (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -358,12 +597,26 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS task_activities_task_created
         ON task_activities(task_id, created_at, id);
 
+      CREATE TABLE IF NOT EXISTS integration_events (
+        event_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        external_origin TEXT NOT NULL,
+        external_key TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'acked')),
+        created_at TEXT NOT NULL,
+        acked_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS integration_events_origin_status_created
+        ON integration_events(external_origin, status, created_at, event_id);
+
       CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         comment_id TEXT REFERENCES comments(id) ON DELETE CASCADE,
         kind TEXT NOT NULL CHECK (kind IN ('inline', 'attachment')),
-        body_fallback INTEGER NOT NULL DEFAULT 1 CHECK (body_fallback IN (0, 1)),
         filename TEXT NOT NULL,
         content_type TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size >= 0),
@@ -411,9 +664,6 @@ export class TaskboardDatabase {
         origin_project_id TEXT NOT NULL,
         origin_project_name TEXT NOT NULL,
         origin_workspace_path TEXT NOT NULL,
-        origin_codex_project_id TEXT,
-        origin_codex_project_kind TEXT,
-        origin_codex_host_id TEXT,
         origin_issue_id TEXT,
         origin_issue_identifier TEXT,
         codex_thread_id TEXT,
@@ -468,16 +718,19 @@ export class TaskboardDatabase {
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
     }
-
-    const aiChatThreadColumns = this.database.prepare("PRAGMA table_info(ai_chat_threads)").all();
-    for (const column of [
-      "origin_codex_project_id",
-      "origin_codex_project_kind",
-      "origin_codex_host_id",
-    ]) {
-      if (!aiChatThreadColumns.some((candidate) => candidate.name === column)) {
-        this.database.exec(`ALTER TABLE ai_chat_threads ADD COLUMN ${column} TEXT`);
-      }
+    if (!projectColumns.some((column) => column.name === "start_date")) {
+      this.database.exec("ALTER TABLE projects ADD COLUMN start_date TEXT");
+    }
+    const projectStartDates = this.database.prepare(
+      "SELECT id, created_at, start_date FROM projects",
+    ).all();
+    const updateProjectStartDate = this.database.prepare(
+      "UPDATE projects SET start_date = ? WHERE id = ?",
+    );
+    for (const project of projectStartDates) {
+      if (project.start_date) continue;
+      const startDate = projectStartDateFromIdentity(project.id, project.created_at);
+      if (startDate) updateProjectStartDate.run(startDate, project.id);
     }
 
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
@@ -501,10 +754,6 @@ export class TaskboardDatabase {
         this.database.exec(`ALTER TABLE tasks ADD COLUMN ${column} TEXT`);
       }
     }
-    this.database.exec(`
-      DROP TRIGGER IF EXISTS tasks_todo_execution_target_insert;
-      DROP TRIGGER IF EXISTS tasks_todo_execution_target_update;
-    `);
     if (hasLinkedThreadId) {
       this.database.exec(`
         UPDATE tasks
@@ -535,9 +784,6 @@ export class TaskboardDatabase {
     }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
-    if (!migratedTaskColumns.some((column) => column.name === "agent_session")) {
-      this.database.exec("ALTER TABLE tasks ADD COLUMN agent_session TEXT");
-    }
     if (!migratedTaskColumns.some((column) => column.name === "creator_type")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN creator_type TEXT NOT NULL DEFAULT 'user'");
     }
@@ -569,7 +815,10 @@ export class TaskboardDatabase {
       DROP INDEX IF EXISTS tasks_external_source_id;
       CREATE UNIQUE INDEX IF NOT EXISTS tasks_external_source_origin_id
       ON tasks(external_source, external_origin, external_id)
-      WHERE external_source IS NOT NULL AND external_origin IS NOT NULL AND external_id IS NOT NULL
+      WHERE external_source IS NOT NULL AND external_origin IS NOT NULL AND external_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS tasks_external_origin_key_unique
+      ON tasks(external_origin, external_key)
+      WHERE external_origin IS NOT NULL AND external_key IS NOT NULL
     `);
     this.database.exec(`
       UPDATE tasks
@@ -698,9 +947,6 @@ export class TaskboardDatabase {
     }
 
     const commentColumns = this.database.prepare("PRAGMA table_info(comments)").all();
-    if (!commentColumns.some((column) => column.name === "agent_session")) {
-      this.database.exec("ALTER TABLE comments ADD COLUMN agent_session TEXT");
-    }
     if (!commentColumns.some((column) => column.name === "thread_id")) {
       this.database.exec("ALTER TABLE comments ADD COLUMN thread_id TEXT");
     }
@@ -788,9 +1034,6 @@ export class TaskboardDatabase {
           )
       `);
     }
-    if (!attachmentColumns.some((column) => column.name === "body_fallback")) {
-      this.database.exec("ALTER TABLE attachments ADD COLUMN body_fallback INTEGER NOT NULL DEFAULT 1 CHECK (body_fallback IN (0, 1))");
-    }
     if (!attachmentColumns.some((column) => column.name === "change_revision")) {
       this.database.exec("ALTER TABLE attachments ADD COLUMN change_revision INTEGER NOT NULL DEFAULT 0");
     }
@@ -823,6 +1066,7 @@ export class TaskboardDatabase {
       SET name = '全局', workspace_path = NULL, updated_at = ?
       WHERE id = 'local' AND (name != '全局' OR workspace_path IS NOT NULL)
     `).run(timestamp);
+    ensureLocalSyncSchema(this.database);
   }
 
   close() {
@@ -912,6 +1156,7 @@ export class TaskboardDatabase {
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.start_date,
         projects.labels,
         projects.created_at,
         projects.updated_at,
@@ -924,28 +1169,32 @@ export class TaskboardDatabase {
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.start_date,
         projects.labels,
         projects.created_at,
         projects.updated_at
-      ORDER BY projects.created_at, projects.id
+      ORDER BY projects.id = 'local' DESC, projects.start_date IS NULL, projects.start_date, projects.created_at, projects.id
     `).all().map(projectFromRow);
   }
 
   createProject(input) {
     const timestamp = now();
+    const startDate = input.startDate ?? projectStartDateFromIdentity(input.id, timestamp);
     try {
       this.database.prepare(`
         INSERT INTO projects (
-          id, name, workspace_path, labels, next_task_number, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 1, ?, ?)
+          id, name, workspace_path, start_date, labels, next_task_number, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
       `).run(
         input.id,
         input.name,
         input.workspacePath,
+        startDate,
         DEFAULT_PROJECT_LABELS_JSON,
         timestamp,
         timestamp,
       );
+      assignProjectPrefixSync(this.database, { id: input.id, name: input.name });
     } catch (error) {
       if (String(error.message).includes("UNIQUE constraint failed")) {
         throw new ApiError(409, "PROJECT_EXISTS", `Project '${input.id}' already exists`);
@@ -955,18 +1204,29 @@ export class TaskboardDatabase {
     return this.getProject(input.id);
   }
 
+  setProjectWorkspacePath(id, workspacePath) {
+    const current = this.getProject(id);
+    if (!current) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
+    const result = this.database.prepare(
+      "UPDATE projects SET workspace_path = ?, updated_at = ? WHERE id = ?",
+    ).run(workspacePath, now(), id);
+    if (result.changes !== 1) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${id}' does not exist`);
+    return this.getProject(id);
+  }
+
   ensureJiraProject(name) {
     const timestamp = now();
     this.database.prepare(`
-      INSERT INTO projects (id, name, workspace_path, next_task_number, created_at, updated_at)
-      VALUES (?, ?, NULL, 1, ?, ?)
+      INSERT INTO projects (id, name, workspace_path, start_date, next_task_number, created_at, updated_at)
+      VALUES (?, ?, NULL, ?, 1, ?, ?)
       ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at
-    `).run(JIRA_PROJECT_ID, name, timestamp, timestamp);
+    `).run(JIRA_PROJECT_ID, name, projectStartDateFromIdentity(JIRA_PROJECT_ID, timestamp), timestamp, timestamp);
     return this.database.prepare(`
       SELECT
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.start_date,
         projects.created_at,
         projects.updated_at,
         COUNT(tasks.id) AS issue_count
@@ -986,13 +1246,13 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       this.database.prepare(`
-        INSERT INTO projects (id, name, workspace_path, labels, next_task_number, created_at, updated_at)
-        VALUES (?, ?, NULL, ?, 1, ?, ?)
+        INSERT INTO projects (id, name, workspace_path, start_date, labels, next_task_number, created_at, updated_at)
+        VALUES (?, ?, NULL, ?, ?, 1, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           name = excluded.name,
           labels = excluded.labels,
           updated_at = excluded.updated_at
-      `).run(JIRA_PROJECT_ID, projectName, projectLabels, timestamp, timestamp);
+      `).run(JIRA_PROJECT_ID, projectName, projectStartDateFromIdentity(JIRA_PROJECT_ID, timestamp), projectLabels, timestamp, timestamp);
       const findExisting = this.database.prepare(`
         SELECT * FROM tasks
         WHERE external_source = 'jira' AND external_origin = ? AND external_id = ?
@@ -1191,6 +1451,7 @@ export class TaskboardDatabase {
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.start_date,
         projects.labels,
         projects.created_at,
         projects.updated_at,
@@ -1204,6 +1465,7 @@ export class TaskboardDatabase {
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.start_date,
         projects.labels,
         projects.created_at,
         projects.updated_at
@@ -1458,11 +1720,10 @@ export class TaskboardDatabase {
       INSERT INTO ai_chat_threads (
         id, title, status,
         origin_project_id, origin_project_name, origin_workspace_path,
-        origin_codex_project_id, origin_codex_project_kind, origin_codex_host_id,
         origin_issue_id, origin_issue_identifier,
         codex_thread_id, model, reasoning_effort, sandbox,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.title,
@@ -1470,9 +1731,6 @@ export class TaskboardDatabase {
       input.origin.projectId,
       input.origin.projectName,
       input.origin.workspacePath,
-      input.origin.codexProjectId ?? null,
-      input.origin.codexProjectKind ?? null,
-      input.origin.codexHostId ?? null,
       input.origin.issueId ?? null,
       input.origin.issueIdentifier ?? null,
       input.codexThreadId ?? null,
@@ -1712,23 +1970,15 @@ export class TaskboardDatabase {
         id
     `;
     const rows = this.database.prepare(sql).all(...values);
-    const relationsByTask = this.#taskRelationsForTasks(rows.map((row) => row.id));
     const commentsByTask = this.#commentsForTaskActivity(rows.map((row) => row.id));
     const activitiesByTask = this.#activitiesForTasks(rows.map((row) => row.id));
     const previewImagesByTask = this.#taskPreviewImages(rows.map((row) => row.id));
     return rows.map((row) => attachTaskActivity(
-      this.#taskWithRelations(row, relationsByTask.get(row.id)),
+      this.#taskWithRelations(row),
       commentsByTask.get(row.id) ?? [],
       activitiesByTask.get(row.id) ?? [],
       previewImagesByTask.get(row.id) ?? null,
     ));
-  }
-
-  getTaskSource(id) {
-    const row = this.database.prepare(
-      "SELECT external_source FROM tasks WHERE id = ? OR identifier = ?",
-    ).get(id, id);
-    return row ? (row.external_source === "jira" ? "jira" : "local") : null;
   }
 
   getTask(id) {
@@ -1814,6 +2064,7 @@ export class TaskboardDatabase {
           projects.name,
           projects.labels,
           projects.next_task_number,
+          projects.identifier_prefix,
           (
             SELECT tasks.identifier
             FROM tasks
@@ -1828,15 +2079,19 @@ export class TaskboardDatabase {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
       }
 
-      const prefix = projectPrefix(project);
+      const prefix = project.identifier_prefix || projectPrefix(project);
       const maximum = this.database.prepare(`
         SELECT MAX(CAST(substr(identifier, ?) AS INTEGER)) AS number
         FROM tasks
         WHERE identifier GLOB ?
       `).get(prefix.length + 2, `${prefix}-[0-9]*`).number;
       const number = Math.max(project.next_task_number, maximum === null ? 1 : maximum + 1);
-      const identifier = `${prefix}-${number}`;
       const id = randomUUID();
+      const useV2Identifiers = v2IdentifiersEnabled(this.database);
+      const identifier = useV2Identifiers
+        ? allocateIdentifierSync(this.database, { project })
+        : `${prefix}-${number}`;
+      if (useV2Identifiers) bindAllocation(this.database, identifier, id);
       const timestamp = now();
       let sortOrder = input.sortOrder;
       if (sortOrder === undefined) {
@@ -1865,8 +2120,8 @@ export class TaskboardDatabase {
           assignee_type, assignee_id, assignee_name, assignee_avatar_url,
           git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
-          archived_at, version, created_at, updated_at, agent_session
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, ?)
+          archived_at, version, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
       `).run(
         id,
         identifier,
@@ -1895,7 +2150,6 @@ export class TaskboardDatabase {
         input.recurrence?.unit ?? null,
         timestamp,
         timestamp,
-        input.agentSession ? JSON.stringify(input.agentSession) : null,
       );
       this.database.exec("COMMIT");
       return this.getTask(id);
@@ -1905,8 +2159,202 @@ export class TaskboardDatabase {
     }
   }
 
-  updateTask(id, version, changes, threadId, threadBinding, actor, agentSession) {
-    const current = this.#requireTaskRecord(id);
+  upsertIntegrationTask(input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const project = this.database.prepare(`
+        SELECT id, name, labels, next_task_number,
+          (
+            SELECT tasks.identifier
+            FROM tasks
+            WHERE tasks.project_id = projects.id
+            ORDER BY tasks.created_at, tasks.id
+            LIMIT 1
+          ) AS first_identifier
+        FROM projects WHERE id = ?
+      `).get(input.projectId);
+      if (!project) {
+        throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${input.projectId}' does not exist`);
+      }
+      const existingRow = this.database.prepare(`
+        SELECT * FROM tasks WHERE external_origin = ? AND external_key = ?
+      `).get(input.externalOrigin, input.externalKey);
+      const timestamp = now();
+      if (existingRow) {
+        const existing = taskFromRow(existingRow);
+        if (existing.projectId !== input.projectId) {
+          throw new ApiError(
+            409,
+            "EXTERNAL_IDENTITY_CONFLICT",
+            `External identity '${input.externalKey}' is already linked to project '${existing.projectId}'`,
+          );
+        }
+        const targetStatus = input.status ?? existing.status;
+        const targetPriority = input.priority ?? existing.priority;
+        const targetLabels = input.labels ?? existing.labels;
+        const changes = taskFieldChanges(existing, {
+          title: input.title,
+          description: input.description,
+          status: targetStatus,
+          priority: targetPriority,
+          labels: targetLabels,
+        });
+        const targetExternalUrl = input.externalUrl ?? existing.externalUrl;
+        if (changes.length > 0 || existing.archivedAt !== null || existing.externalUrl !== targetExternalUrl) {
+          let sortOrder = existing.sortOrder;
+          if (existing.status !== targetStatus) {
+            const row = this.database.prepare(`
+              SELECT MIN(sort_order) AS minimum
+              FROM tasks
+              WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
+            `).get(input.projectId, targetStatus, existing.id);
+            sortOrder = row.minimum === null ? 1000 : row.minimum - 1000;
+          }
+          this.database.prepare(`
+            UPDATE tasks SET
+              title = ?, description = ?, status = ?, priority = ?, labels = ?, sort_order = ?,
+              external_url = ?, archived_at = NULL, version = version + 1, updated_at = ?
+            WHERE id = ?
+          `).run(
+            input.title,
+            input.description,
+            targetStatus,
+            targetPriority,
+            JSON.stringify(targetLabels),
+            sortOrder,
+            targetExternalUrl,
+            timestamp,
+            existing.id,
+          );
+          this.#recordTaskActivity(existing.id, input.actor, changes, timestamp);
+        }
+        this.database.prepare("UPDATE projects SET updated_at = ? WHERE id = ?")
+          .run(timestamp, input.projectId);
+        this.database.exec("COMMIT");
+        return { task: this.getTask(existing.id), created: false };
+      }
+
+      const prefix = projectPrefix(project);
+      const maximum = this.database.prepare(`
+        SELECT MAX(CAST(substr(identifier, ?) AS INTEGER)) AS number
+        FROM tasks WHERE identifier GLOB ?
+      `).get(prefix.length + 2, `${prefix}-[0-9]*`).number;
+      const number = Math.max(project.next_task_number, maximum === null ? 1 : maximum + 1);
+      const identifier = `${prefix}-${number}`;
+      const id = randomUUID();
+      const placement = this.database.prepare(`
+        SELECT MIN(sort_order) AS minimum FROM tasks
+        WHERE project_id = ? AND status = ? AND archived_at IS NULL
+      `).get(input.projectId, input.status ?? "todo");
+      const sortOrder = placement.minimum === null ? 1000 : placement.minimum - 1000;
+      const status = input.status ?? "todo";
+      const priority = input.priority ?? "none";
+      const labels = [...new Set([...JSON.parse(project.labels), ...(input.labels ?? [])])];
+      this.database.prepare(`
+        UPDATE projects SET next_task_number = ?, labels = ?, updated_at = ? WHERE id = ?
+      `).run(number + 1, JSON.stringify(labels), timestamp, input.projectId);
+      this.database.prepare(`
+        INSERT INTO tasks (
+          id, identifier, project_id, title, description, status, priority, labels,
+          sort_order, creator_type, creator_id, creator_name, creator_avatar_url,
+          assignee_type, assignee_id, assignee_name, assignee_avatar_url,
+          external_source, external_origin, external_id, external_key, external_url,
+          archived_at, version, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          'integration', ?, ?, ?, ?, NULL, 1, ?, ?
+        )
+      `).run(
+        id,
+        identifier,
+        input.projectId,
+        input.title,
+        input.description,
+        status,
+        priority,
+        JSON.stringify(input.labels ?? []),
+        sortOrder,
+        input.actor.type,
+        input.actor.id,
+        input.actor.name,
+        input.actor.avatarUrl,
+        input.actor.type,
+        input.actor.id,
+        input.actor.name,
+        input.actor.avatarUrl,
+        input.externalOrigin,
+        input.externalKey,
+        input.externalKey,
+        input.externalUrl ?? null,
+        timestamp,
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return { task: this.getTask(id), created: true };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listIntegrationEvents(externalOrigin, status = "pending") {
+    if (!externalOrigin) throw new ApiError(400, "INVALID_FIELD", "'origin' is required");
+    if (!['pending', 'acked'].includes(status)) {
+      throw new ApiError(400, "INVALID_FIELD", "'status' must be pending or acked");
+    }
+    return this.database.prepare(`
+      SELECT event_id, task_id, external_origin, external_key, event_type, payload,
+             status, created_at, acked_at
+      FROM integration_events
+      WHERE external_origin = ? AND status = ?
+      ORDER BY created_at, event_id
+    `).all(externalOrigin, status).map((row) => ({
+      eventId: row.event_id,
+      taskId: row.task_id,
+      externalOrigin: row.external_origin,
+      externalKey: row.external_key,
+      eventType: row.event_type,
+      payload: JSON.parse(row.payload),
+      status: row.status,
+      createdAt: row.created_at,
+      ackedAt: row.acked_at,
+    }));
+  }
+
+  ackIntegrationEvent(eventId) {
+    const current = this.database.prepare(
+      "SELECT event_id, status FROM integration_events WHERE event_id = ?",
+    ).get(eventId);
+    if (!current) throw new ApiError(404, "INTEGRATION_EVENT_NOT_FOUND", `Integration event '${eventId}' does not exist`);
+    if (current.status === "pending") {
+      this.database.prepare(
+        "UPDATE integration_events SET status = 'acked', acked_at = ? WHERE event_id = ?",
+      ).run(now(), eventId);
+    }
+    return { eventId, status: "acked" };
+  }
+
+  #recordIntegrationStatusEvent(current, afterStatus, expectedVersion, timestamp) {
+    if (
+      current.externalSource !== "integration"
+      || !current.externalOrigin
+      || !current.externalKey
+      || current.status === afterStatus
+    ) return;
+    this.database.prepare(`
+      INSERT INTO integration_events (
+        event_id, task_id, external_origin, external_key, event_type, payload,
+        status, created_at, acked_at
+      ) VALUES (?, ?, ?, ?, 'task.status.changed', ?, 'pending', ?, NULL)
+    `).run(
+      randomUUID(), current.id, current.externalOrigin, current.externalKey,
+      JSON.stringify({ field: "status", before: current.status, after: afterStatus, expectedVersion }),
+      timestamp,
+    );
+  }
+
+  updateTask(id, version, changes, threadId, threadBinding, actor) {
+    const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
@@ -2005,10 +2453,6 @@ export class TaskboardDatabase {
       );
       values.push(...storedBinding);
     }
-    if (agentSession !== undefined) {
-      assignments.push("agent_session = ?");
-      values.push(agentSession ? JSON.stringify(agentSession) : null);
-    }
     assignments.push("version = version + 1", "updated_at = ?");
     const timestamp = now();
     values.push(timestamp, current.id, version);
@@ -2020,9 +2464,6 @@ export class TaskboardDatabase {
       `).run(...values);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
-      }
-      if (Object.hasOwn(changes, "description")) {
-        this.#consumeAttachmentBodyFallback(current.id, null);
       }
       if (projectChanged) {
         this.database.prepare(`
@@ -2042,6 +2483,9 @@ export class TaskboardDatabase {
         `).run(JSON.stringify(mergedLabels), timestamp, destinationProjectId);
       }
       this.#recordTaskActivity(current.id, actor, activityChanges, timestamp);
+      if (Object.hasOwn(changes, "status") && changes.status !== current.status) {
+        this.#recordIntegrationStatusEvent(current, changes.status, version + 1, timestamp);
+      }
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -2050,7 +2494,7 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
-  moveTask(id, version, status, sortOrder, threadId, threadBinding, actor, agentSession) {
+  moveTask(id, version, status, sortOrder, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     if (current.archivedAt !== null) {
@@ -2074,8 +2518,6 @@ export class TaskboardDatabase {
 
     const timestamp = now();
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
-    const sessionAssignment = agentSession === undefined ? "" : "agent_session = ?,";
-    const sessionValues = agentSession === undefined ? [] : [agentSession ? JSON.stringify(agentSession) : null];
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2084,9 +2526,9 @@ export class TaskboardDatabase {
     try {
       const result = this.database.prepare(`
         UPDATE tasks
-        SET status = ?, sort_order = ?, ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?
+        SET status = ?, sort_order = ?, ${threadAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
-      `).run(status, sortOrder, ...(storedBinding ?? []), ...sessionValues, timestamp, current.id, version);
+      `).run(status, sortOrder, ...(storedBinding ?? []), timestamp, current.id, version);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
@@ -2096,6 +2538,7 @@ export class TaskboardDatabase {
         taskFieldChanges(current, { status }),
         timestamp,
       );
+      this.#recordIntegrationStatusEvent(current, status, version + 1, timestamp);
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -2104,13 +2547,11 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
-  archiveTask(id, version, threadId, threadBinding, actor, agentSession) {
+  archiveTask(id, version, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     const timestamp = now();
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
-    const sessionAssignment = agentSession === undefined ? "" : "agent_session = ?,";
-    const sessionValues = agentSession === undefined ? [] : [agentSession ? JSON.stringify(agentSession) : null];
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2119,9 +2560,9 @@ export class TaskboardDatabase {
     try {
       const result = this.database.prepare(`
         UPDATE tasks
-        SET archived_at = ?, ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?
+        SET archived_at = ?, ${threadAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
-      `).run(timestamp, ...(storedBinding ?? []), ...sessionValues, timestamp, current.id, version);
+      `).run(timestamp, ...(storedBinding ?? []), timestamp, current.id, version);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
@@ -2139,7 +2580,7 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
-  restoreTask(id, version, threadId, threadBinding, actor, agentSession) {
+  restoreTask(id, version, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     if (current.archivedAt === null) {
@@ -2147,8 +2588,6 @@ export class TaskboardDatabase {
     }
     const timestamp = now();
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
-    const sessionAssignment = agentSession === undefined ? "" : "agent_session = ?,";
-    const sessionValues = agentSession === undefined ? [] : [agentSession ? JSON.stringify(agentSession) : null];
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2157,9 +2596,9 @@ export class TaskboardDatabase {
     try {
       const result = this.database.prepare(`
         UPDATE tasks
-        SET archived_at = NULL, ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?
+        SET archived_at = NULL, ${threadAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
-      `).run(...(storedBinding ?? []), ...sessionValues, timestamp, current.id, version);
+      `).run(...(storedBinding ?? []), timestamp, current.id, version);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
@@ -2200,7 +2639,7 @@ export class TaskboardDatabase {
     }
   }
 
-  addTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin = "manual", agentSession) {
+  addTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin = "manual") {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -2249,7 +2688,7 @@ export class TaskboardDatabase {
           relation_type, source_task_id, target_task_id, origin, created_at
         ) VALUES (?, ?, ?, ?, ?)
       `).run(relationType, sourceTaskId, targetTaskId, origin, timestamp);
-      this.#touchTask(task.id, version, threadId, threadBinding, timestamp, agentSession);
+      this.#touchTask(task.id, version, threadId, threadBinding, timestamp);
       this.#recordTaskActivity(task.id, actor, [{
         field: "relation",
         before: previousRelation,
@@ -2266,7 +2705,7 @@ export class TaskboardDatabase {
     }
   }
 
-  removeTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin, agentSession) {
+  removeTaskRelation(id, version, type, relatedId, threadId, threadBinding, actor, origin) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -2346,7 +2785,7 @@ export class TaskboardDatabase {
         };
       }
       const timestamp = now();
-      this.#touchTask(task.id, version, threadId, threadBinding, timestamp, agentSession);
+      this.#touchTask(task.id, version, threadId, threadBinding, timestamp);
       this.#recordTaskActivity(task.id, actor, [{
         field: "relation",
         before: relationActivityValue(type, relatedTask),
@@ -2373,24 +2812,110 @@ export class TaskboardDatabase {
   }
 
   listComments(taskId) {
-    const task = this.#requireTaskRecord(taskId);
-    const rows = this.database.prepare(`
+    const task = this.#requireTask(taskId);
+    return this.database.prepare(`
       SELECT * FROM comments
       WHERE task_id = ?
       ORDER BY created_at, id
-    `).all(task.id);
-    return this.#commentsWithAttachments(rows);
+    `).all(task.id).map((row) => this.#commentWithAttachments(row));
   }
 
   listCommentsAfter(taskId, after) {
-    const task = this.#requireTaskRecord(taskId);
-    const rows = this.database.prepare(`
+    const task = this.#requireTask(taskId);
+    return this.database.prepare(`
       SELECT * FROM comments
       WHERE task_id = ?
         AND change_revision > ?
       ORDER BY change_revision
-    `).all(task.id, after.revision);
-    return this.#commentsWithAttachments(rows);
+    `).all(task.id, after.revision)
+      .map((row) => this.#commentWithAttachments(row));
+  }
+
+  getCommentAgentDispatch(commentId) {
+    const row = this.database.prepare(`
+      SELECT status, thread_id, run_id, attempts, error, created_at, updated_at,
+             started_at, finished_at
+      FROM comment_agent_dispatches
+      WHERE comment_id = ?
+    `).get(commentId);
+    return commentAgentDispatchFromRow(row);
+  }
+
+  listPendingCommentAgentDispatches(limit = 20) {
+    return this.database.prepare(`
+      SELECT comment_id, task_id, status, thread_id, run_id, attempts, error,
+             created_at, updated_at, next_attempt_at, started_at, finished_at
+      FROM comment_agent_dispatches
+      WHERE status = 'pending' AND next_attempt_at <= ?
+      ORDER BY created_at, comment_id
+      LIMIT ?
+    `).all(now(), limit);
+  }
+
+  claimCommentAgentDispatch(commentId) {
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.database.prepare(`
+        UPDATE comment_agent_dispatches
+        SET status = 'running', attempts = attempts + 1, updated_at = ?, started_at = ?, error = NULL
+        WHERE comment_id = ? AND status = 'pending' AND next_attempt_at <= ?
+      `).run(timestamp, timestamp, commentId, timestamp);
+      this.database.exec("COMMIT");
+      if (result.changes !== 1) return null;
+      return this.database.prepare(`
+        SELECT comment_id, task_id, status, thread_id, run_id, attempts, error,
+               created_at, updated_at, next_attempt_at, started_at, finished_at
+        FROM comment_agent_dispatches WHERE comment_id = ?
+      `).get(commentId);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  setCommentAgentDispatchRun(commentId, threadId, runId) {
+    const timestamp = now();
+    this.database.prepare(`
+      UPDATE comment_agent_dispatches
+      SET thread_id = ?, run_id = ?, updated_at = ?
+      WHERE comment_id = ? AND status = 'running'
+    `).run(threadId, runId, timestamp, commentId);
+    return this.getCommentAgentDispatch(commentId);
+  }
+
+  completeCommentAgentDispatch(commentId, status = "completed", error = null) {
+    if (!['completed', 'failed'].includes(status)) {
+      throw new ApiError(400, "INVALID_DISPATCH_STATUS", "Invalid comment agent dispatch status");
+    }
+    const timestamp = now();
+    this.database.prepare(`
+      UPDATE comment_agent_dispatches
+      SET status = ?, error = ?, updated_at = ?, finished_at = ?
+      WHERE comment_id = ?
+    `).run(status, error, timestamp, timestamp, commentId);
+    return this.getCommentAgentDispatch(commentId);
+  }
+
+  retryCommentAgentDispatch(commentId, error, delayMs = 1_000) {
+    const timestamp = now();
+    const nextAttemptAt = new Date(Date.now() + Math.max(0, delayMs)).toISOString();
+    this.database.prepare(`
+      UPDATE comment_agent_dispatches
+      SET status = 'pending', error = ?, updated_at = ?, next_attempt_at = ?, finished_at = NULL
+      WHERE comment_id = ?
+    `).run(String(error ?? "").slice(0, 65_536), timestamp, nextAttemptAt, commentId);
+    return this.getCommentAgentDispatch(commentId);
+  }
+
+  findAiChatThreadForIssue(issueId) {
+    const row = this.database.prepare(`
+      SELECT * FROM ai_chat_threads
+      WHERE origin_issue_id = ?
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 1
+    `).get(issueId);
+    return row ? this.#aiChatThreadWithCurrentRun(row) : null;
   }
 
   createComment(taskId, input) {
@@ -2405,8 +2930,8 @@ export class TaskboardDatabase {
           id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           author_type, author_id, author_name, author_avatar_url,
-          version, created_at, updated_at, change_revision, agent_session
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+          version, created_at, updated_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
       `).run(
         id,
         task.id,
@@ -2419,8 +2944,14 @@ export class TaskboardDatabase {
         timestamp,
         timestamp,
         changeRevision,
-        input.agentSession ? JSON.stringify(input.agentSession) : null,
       );
+      if (input.autoDispatch ?? input.actor.type === "user") {
+        this.database.prepare(`
+          INSERT INTO comment_agent_dispatches (
+            comment_id, task_id, status, attempts, created_at, updated_at, next_attempt_at
+          ) VALUES (?, ?, 'pending', 0, ?, ?, ?)
+        `).run(id, task.id, timestamp, timestamp, timestamp);
+      }
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -2434,10 +2965,8 @@ export class TaskboardDatabase {
     return row ? this.#commentWithAttachments(row) : null;
   }
 
-  updateComment(id, version, body, threadId, threadBinding, agentSession) {
+  updateComment(id, version, body, threadId, threadBinding) {
     const storedBinding = storedThreadBinding(threadBinding, threadId);
-    const sessionAssignment = agentSession === undefined ? "" : "agent_session = ?,";
-    const sessionValues = agentSession === undefined ? [] : [agentSession ? JSON.stringify(agentSession) : null];
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2449,14 +2978,13 @@ export class TaskboardDatabase {
       const changeRevision = this.#nextCommentAttachmentRevision();
       const result = this.database.prepare(`
         UPDATE comments
-        SET body = ?, ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?,
+        SET body = ?, ${threadAssignment} version = version + 1, updated_at = ?,
           change_revision = ?
         WHERE id = ? AND version = ?
-      `).run(body, ...(storedBinding ?? []), ...sessionValues, now(), changeRevision, id, version);
+      `).run(body, ...(storedBinding ?? []), now(), changeRevision, id, version);
       if (result.changes !== 1) {
         this.#throwMissingCommentOrConflict(id, version);
       }
-      this.#consumeAttachmentBodyFallback(current.taskId, current.id);
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -2571,28 +3099,18 @@ export class TaskboardDatabase {
     return attachment;
   }
 
-  #commentWithAttachments(row, attachments = this.#attachmentsForComment(row.id)) {
+  #commentWithAttachments(row) {
     const comment = commentFromRow(row);
-    comment.attachments = attachments;
+    comment.attachments = this.#attachmentsForComment(comment.id);
+    comment.agentDispatch = commentAgentDispatchFromRow(
+      this.database.prepare(`
+        SELECT status, thread_id, run_id, attempts, error, created_at, updated_at,
+               started_at, finished_at
+        FROM comment_agent_dispatches
+        WHERE comment_id = ?
+      `).get(comment.id),
+    );
     return comment;
-  }
-
-  #commentsWithAttachments(rows) {
-    const attachmentsByComment = new Map(rows.map((row) => [row.id, []]));
-    const commentIds = rows.map((row) => row.id);
-    for (let offset = 0; offset < commentIds.length; offset += 400) {
-      const chunk = commentIds.slice(offset, offset + 400);
-      const placeholders = chunk.map(() => "?").join(", ");
-      const attachments = this.database.prepare(`
-        SELECT * FROM attachments
-        WHERE comment_id IN (${placeholders})
-        ORDER BY comment_id, created_at, id
-      `).all(...chunk);
-      for (const attachment of attachments) {
-        attachmentsByComment.get(attachment.comment_id).push(attachmentFromRow(attachment));
-      }
-    }
-    return rows.map((row) => this.#commentWithAttachments(row, attachmentsByComment.get(row.id)));
   }
 
   #aiChatThreadWithCurrentRun(row) {
@@ -2626,9 +3144,9 @@ export class TaskboardDatabase {
       const rows = this.database.prepare(`
         SELECT
           id, task_id,
-          CASE WHEN thread_id IS NULL AND agent_session IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
+          CASE WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
           thread_id, thread_codex_project_id, thread_codex_project_kind,
-          thread_codex_host_id, thread_workspace_path, agent_session,
+          thread_codex_host_id, thread_workspace_path,
           author_type, author_id, author_name,
           author_avatar_url, version, updated_at
         FROM comments
@@ -2697,19 +3215,6 @@ export class TaskboardDatabase {
     `).all(commentId).map(attachmentFromRow);
   }
 
-  #consumeAttachmentBodyFallback(taskId, commentId) {
-    const candidates = this.database.prepare(`
-      SELECT id FROM attachments
-      WHERE task_id = ? AND comment_id IS ? AND body_fallback = 1
-    `).all(taskId, commentId);
-    const update = this.database.prepare(`
-      UPDATE attachments SET body_fallback = 0, change_revision = ? WHERE id = ?
-    `);
-    for (const attachment of candidates) {
-      update.run(this.#nextCommentAttachmentRevision(), attachment.id);
-    }
-  }
-
   #nextCommentAttachmentRevision() {
     return this.database.prepare(`
       UPDATE comment_attachment_revision
@@ -2719,22 +3224,60 @@ export class TaskboardDatabase {
     `).get().value;
   }
 
-  #taskRelationsForTasks(taskIds) {
-    const relationsByTask = new Map();
-    for (let offset = 0; offset < taskIds.length; offset += 400) {
-      const chunk = taskIds.slice(offset, offset + 400);
-      const placeholders = chunk.map(() => "?").join(", ");
-      const rows = this.database.prepare(taskRelationsQuery(placeholders)).all(...chunk);
-      for (const [taskId, relations] of taskRelationsFromRows(chunk, rows, taskRelationSummaryFromRow)) {
-        relationsByTask.set(taskId, relations);
-      }
-    }
-    return relationsByTask;
-  }
-
-  #taskWithRelations(row, relations = this.#taskRelationsForTasks([row.id]).get(row.id)) {
+  #taskWithRelations(row) {
     const task = taskFromRow(row);
-    task.relations = relations;
+    const parent = this.database.prepare(`
+      SELECT tasks.*
+      FROM task_relations
+      JOIN tasks ON tasks.id = task_relations.source_task_id
+      WHERE task_relations.relation_type = 'parent'
+        AND task_relations.target_task_id = ?
+    `).get(task.id);
+    const subIssues = this.database.prepare(`
+      SELECT tasks.*
+      FROM task_relations
+      JOIN tasks ON tasks.id = task_relations.target_task_id
+      WHERE task_relations.relation_type = 'parent'
+        AND task_relations.source_task_id = ?
+      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
+    `).all(task.id);
+    const blockedBy = this.database.prepare(`
+      SELECT tasks.*
+      FROM task_relations
+      JOIN tasks ON tasks.id = task_relations.source_task_id
+      WHERE task_relations.relation_type = 'blocks'
+        AND task_relations.target_task_id = ?
+      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
+    `).all(task.id);
+    const blocks = this.database.prepare(`
+      SELECT tasks.*
+      FROM task_relations
+      JOIN tasks ON tasks.id = task_relations.target_task_id
+      WHERE task_relations.relation_type = 'blocks'
+        AND task_relations.source_task_id = ?
+      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
+    `).all(task.id);
+    const related = this.database.prepare(`
+      SELECT tasks.*
+      FROM task_relations
+      JOIN tasks ON tasks.id = CASE
+        WHEN task_relations.source_task_id = ? THEN task_relations.target_task_id
+        ELSE task_relations.source_task_id
+      END
+      WHERE task_relations.relation_type = 'related'
+        AND (
+          task_relations.source_task_id = ?
+          OR task_relations.target_task_id = ?
+        )
+      ORDER BY tasks.sort_order, tasks.created_at, tasks.id
+    `).all(task.id, task.id, task.id);
+    task.relations = {
+      parent: parent ? taskRelationSummaryFromRow(parent) : null,
+      subIssues: subIssues.map(taskRelationSummaryFromRow),
+      blockedBy: blockedBy.map(taskRelationSummaryFromRow),
+      blocks: blocks.map(taskRelationSummaryFromRow),
+      related: related.map(taskRelationSummaryFromRow),
+    };
     return task;
   }
 
@@ -2810,31 +3353,21 @@ export class TaskboardDatabase {
     );
   }
 
-  #touchTask(id, version, threadId, threadBinding, timestamp, agentSession) {
+  #touchTask(id, version, threadId, threadBinding, timestamp) {
     const current = this.#requireTask(id);
     const storedBinding = storedThreadBindingForExisting(current, threadBinding, threadId);
-    const sessionAssignment = agentSession === undefined ? "" : "agent_session = ?,";
-    const sessionValues = agentSession === undefined ? [] : [agentSession ? JSON.stringify(agentSession) : null];
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
       : "";
     const result = this.database.prepare(`
       UPDATE tasks
-      SET ${threadAssignment}${sessionAssignment} version = version + 1, updated_at = ?
+      SET ${threadAssignment} version = version + 1, updated_at = ?
       WHERE id = ? AND version = ?
-    `).run(...(storedBinding ?? []), ...sessionValues, timestamp, id, version);
+    `).run(...(storedBinding ?? []), timestamp, id, version);
     if (result.changes !== 1) {
       this.#throwMissingOrConflict(id, version);
     }
-  }
-
-  #requireTaskRecord(id) {
-    const row = this.database.prepare("SELECT * FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
-    if (!row) {
-      throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
-    }
-    return taskFromRow(row);
   }
 
   #requireTask(id) {
@@ -2872,7 +3405,10 @@ export class TaskboardDatabase {
   }
 
   #throwMissingOrConflict(id, expectedVersion) {
-    const task = this.#requireTaskRecord(id);
+    const task = this.getTask(id);
+    if (!task) {
+      throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+    }
     throw new ApiError(409, "VERSION_CONFLICT", "Task was changed by another client", {
       expectedVersion,
       actualVersion: task.version,

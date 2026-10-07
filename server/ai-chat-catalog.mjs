@@ -8,8 +8,8 @@ import { parse as parseToml } from "smol-toml";
 
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import { executableCommand } from "../shared/executable-command.mjs";
-import { composerReferencePersistence } from "../shared/composer-reference.mjs";
-import { ApiError } from "../shared/api-fields.mjs";
+import { composerReferencePersistence } from "./composer-reference.mjs";
+import { ApiError } from "./database.mjs";
 
 const execFileAsync = promisify(execFile);
 const CATALOG_TIMEOUT_MS = 10_000;
@@ -291,6 +291,13 @@ export async function resolveAiWorkspace(projectId, codexStatePath, database) {
 
 export async function resolveMappedAiWorkspace(projectId, project, projectMappings = {}) {
   const workspaces = await loadMappedWorkspaces(projectMappings);
+  // Keep the database mapping as a durable fallback when the companion config
+  // has not been hydrated yet (or was reset on this device). The companion
+  // mapping still wins whenever it exists and points to a live directory.
+  if (!workspaces.has(projectId)) {
+    const workspacePath = await existingDirectory(project?.workspacePath);
+    if (workspacePath) workspaces.set(projectId, workspacePath);
+  }
   return resolvedWorkspace(projectId, project, workspaces);
 }
 
@@ -330,49 +337,6 @@ function sanitizeModels(value) {
       description: typeof model.description === "string" ? model.description : "",
       defaultReasoningEffort: typeof model.default_reasoning_level === "string"
         ? model.default_reasoning_level.trim()
-        : "",
-      supportedReasoningEfforts: efforts,
-      serviceTiers,
-    }];
-  });
-}
-
-function sanitizeAppServerModels(value) {
-  if (!Array.isArray(value)) throw new Error("Codex returned an invalid model catalog");
-  return value.flatMap((model) => {
-    if (
-      !model
-      || typeof model !== "object"
-      || model.hidden === true
-      || typeof model.model !== "string"
-      || !model.model.trim()
-    ) return [];
-    const slug = model.model.trim();
-    const efforts = Array.isArray(model.supportedReasoningEfforts)
-      ? [...new Set(model.supportedReasoningEfforts.flatMap((entry) => (
-          typeof entry?.reasoningEffort === "string" && entry.reasoningEffort.trim()
-            ? [entry.reasoningEffort.trim()]
-            : []
-        )))]
-      : [];
-    const serviceTiers = Array.isArray(model.serviceTiers)
-      ? model.serviceTiers.flatMap((tier) => (
-          typeof tier?.id === "string"
-          && tier.id.trim()
-          && typeof tier.name === "string"
-          && tier.name.trim()
-            ? [{ id: tier.id.trim(), name: tier.name.trim() }]
-            : []
-        ))
-      : [];
-    return [{
-      slug,
-      displayName: typeof model.displayName === "string" && model.displayName.trim()
-        ? model.displayName.trim()
-        : slug,
-      description: typeof model.description === "string" ? model.description : "",
-      defaultReasoningEffort: typeof model.defaultReasoningEffort === "string"
-        ? model.defaultReasoningEffort.trim()
         : "",
       supportedReasoningEfforts: efforts,
       serviceTiers,
@@ -651,14 +615,13 @@ function referenceUnavailable(nodeIndex, reasonCode = "SOURCE_UNAVAILABLE") {
 }
 
 export class ComposerCatalog {
-  constructor({ appServer, agentsDirectory, codexHome, issueSlashCommands, configuredAgents } = {}) {
+  constructor({ appServer, agentsDirectory, codexHome, issueSlashCommands } = {}) {
     this.appServer = appServer;
     this.codexHome = codexHome
       ?? (agentsDirectory ? path.dirname(agentsDirectory) : process.env.CODEX_HOME)
       ?? path.join(os.homedir(), ".codex");
     this.agentsDirectory = agentsDirectory ?? path.join(this.codexHome, "agents");
     this.issueSlashCommands = issueSlashCommands ?? null;
-    this.configuredAgents = configuredAgents ?? listConfiguredAgents;
     this.workspaces = new Map();
     this.unsubscribe = appServer.subscribe((notification) => {
       if (notification?.method === "skills/changed") this.invalidate();
@@ -714,7 +677,7 @@ export class ComposerCatalog {
         skillsAvailable = true;
       } catch {}
     }
-    const { agents, available: agentsAvailable } = await this.configuredAgents({
+    const { agents, available: agentsAvailable } = await listConfiguredAgents({
       codexHome: this.codexHome,
       agentsDirectory: this.agentsDirectory,
       workspacePath,
@@ -815,7 +778,7 @@ export class ComposerCatalog {
       entries = await this.appServer.listSkills(workspacePath, { forceReload: true });
       skillsAvailable = true;
     } catch {}
-    const { agents, available: agentsAvailable } = await this.configuredAgents({
+    const { agents, available: agentsAvailable } = await listConfiguredAgents({
       codexHome: this.codexHome,
       agentsDirectory: this.agentsDirectory,
       workspacePath,
@@ -921,7 +884,7 @@ export class ComposerCatalog {
       ));
       throw referenceUnavailable(Math.max(firstReferenceIndex, 0));
     }
-    const { agents } = await this.configuredAgents({
+    const { agents } = await listConfiguredAgents({
       codexHome: this.codexHome,
       agentsDirectory: this.agentsDirectory,
       workspacePath,
@@ -1010,20 +973,6 @@ export async function discoverAiCatalog({
   const modelCatalog = JSON.parse(modelResult.stdout);
   return {
     models: sanitizeModels(modelCatalog?.models),
-    skills: sanitizeSkills(skillEntries),
-    commands,
-    sandboxes: ["read-only", "workspace-write", "danger-full-access"],
-  };
-}
-
-export async function discoverAppServerAiCatalog({ appServer, workspacePath }) {
-  const [modelResult, skillEntries, commands] = await Promise.all([
-    appServer.request("model/list", { cursor: null, limit: 100, includeHidden: false }),
-    appServer.listSkills(workspacePath, { forceReload: false }),
-    loadSlashCommands(),
-  ]);
-  return {
-    models: sanitizeAppServerModels(modelResult?.data),
     skills: sanitizeSkills(skillEntries),
     commands,
     sandboxes: ["read-only", "workspace-write", "danger-full-access"],

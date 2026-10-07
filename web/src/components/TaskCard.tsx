@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import remarkGfm from "remark-gfm";
+import { taskDisplayIdentifier } from "../taskDisplayIdentifier";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
 import { resolvePersistedAttachmentUrl } from "../api";
@@ -31,6 +32,7 @@ interface TaskCardProps {
   task: Task;
   variant?: "main" | "sidebar";
   presentation: TaskCardPresentation;
+  now: number;
   isDragging: boolean;
   dragShift: number;
   isMoving: boolean;
@@ -41,11 +43,10 @@ interface TaskCardProps {
   currentUser: ActorIdentity;
   showCover: boolean;
   showBody: boolean;
-  showCreatedAt: boolean;
   onCreateLabel: (label: string) => Promise<void>;
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
-  onComplete?: (task: Task) => Promise<void>;
+  onComplete?: (task: Task) => void;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
@@ -89,7 +90,7 @@ function calendarDate(value: string, locale: string) {
 }
 
 function createdDate(value: string, locale: string, text: (chinese: string, english: string) => string) {
-  const formatted = new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" })
+  const formatted = new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric" })
     .format(new Date(value));
   return text(`${formatted}创建`, `Created ${formatted}`);
 }
@@ -195,38 +196,26 @@ function ProcessingProgress({
   );
 }
 
-function ProcessingLabel({ processing }: { processing: TaskCardPresentation["processing"] }) {
-  const { text } = useTaskboardI18n();
-  const { running, startedAt } = processing;
-  const [now, setNow] = useState(Date.now);
-  useEffect(() => {
-    if (!running || !startedAt) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, [running, startedAt]);
-  const elapsed = elapsedTime(startedAt, now);
-  return (
-    <span className="task-processing-label">
-      {running
-        ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
-        : text("暂停处理", "Processing paused")}
-    </span>
-  );
-}
-
 function ProcessingStatusRow({
   presentation,
+  now,
   onOpenConversation,
 }: {
   presentation: TaskCardPresentation;
+  now: number;
   onOpenConversation: (conversation: TaskConversationItem) => void;
 }) {
+  const { text } = useTaskboardI18n();
+  const elapsed = elapsedTime(presentation.processing.startedAt, now);
   const running = presentation.processing.running;
   return (
     <div className={`task-processing-row${running ? " is-running" : " is-paused"}`}>
       {running && <img className="task-processing-glyph" src={processingAnimation} alt="" aria-hidden="true" />}
-      <ProcessingLabel processing={presentation.processing} />
+      <span className="task-processing-label">
+        {running
+          ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
+          : text("暂停处理", "Processing paused")}
+      </span>
       <span className="task-processing-spacer" aria-hidden="true" />
       {presentation.conversations.length > 0 && (
         <TaskConversationMenu
@@ -296,7 +285,7 @@ function PriorityControl({
   onChange: (priority: TaskPriority) => void;
 }) {
   const { language, text } = useTaskboardI18n();
-  const displayIdentifier = task.externalKey ?? task.identifier;
+  const displayIdentifier = taskDisplayIdentifier(task);
   return (
     <TaskPropertyPicker
       value={task.priority}
@@ -331,7 +320,7 @@ function DueDateControl({
   onChange: (dueDate: string | null) => void;
 }) {
   const { locale, text } = useTaskboardI18n();
-  const displayIdentifier = task.externalKey ?? task.identifier;
+  const displayIdentifier = taskDisplayIdentifier(task);
   if (!task.dueDate) return null;
   return (
     <label className="due-date-chip card-property-control" title={text(`截止日期 ${task.dueDate}`, `Due date ${task.dueDate}`)}>
@@ -349,7 +338,7 @@ function DueDateControl({
 
 function AssigneeControl({
   task,
-  participants: persistedParticipants,
+  participants,
   currentUser,
   disabled,
   open,
@@ -365,13 +354,8 @@ function AssigneeControl({
   onChange: (target: AssigneeTarget) => void;
 }) {
   const { text } = useTaskboardI18n();
-  const displayIdentifier = task.externalKey ?? task.identifier;
-  const currentUserKey = actorKey(currentUser);
-  const assignee = actorKey(task.assignee) === currentUserKey ? currentUser : task.assignee;
-  const participants = persistedParticipants.map((participant) => (
-    actorKey(participant) === currentUserKey ? currentUser : participant
-  ));
-  const options = [assignee, currentUser, CODEX_AGENT_ACTOR]
+  const displayIdentifier = taskDisplayIdentifier(task);
+  const options = [task.assignee, currentUser, CODEX_AGENT_ACTOR]
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));
@@ -380,7 +364,7 @@ function AssigneeControl({
       value={actorKey(task.assignee)}
       options={options.map((actor) => ({
         value: actorKey(actor),
-        label: actorKey(actor) === currentUserKey ? text(`${actor.name}（我）`, `${actor.name} (me)`) : actor.name,
+        label: actor.id === currentUser.id ? text(`${actor.name}（我）`, `${actor.name} (me)`) : actor.name,
         icon: <ActorAvatar actor={actor} className="task-property-assignee-avatar" />,
       }))}
       open={open}
@@ -389,7 +373,7 @@ function AssigneeControl({
       triggerClassName="task-assignee-trigger"
       triggerContent={<ParticipantAvatars participants={participants} />}
       ariaLabel={text(`${displayIdentifier} 负责人`, `${displayIdentifier} assignee`)}
-      title={text(`负责人：${assignee.name}`, `Assignee: ${assignee.name}`)}
+      title={text(`负责人：${task.assignee.name}`, `Assignee: ${task.assignee.name}`)}
       onOpenChange={onOpenChange}
       onChange={(value) => {
         const selected = options.find((actor) => actorKey(actor) === value);
@@ -404,6 +388,7 @@ export function TaskCard({
   task,
   variant = "main",
   presentation,
+  now,
   isDragging,
   dragShift,
   isMoving,
@@ -414,7 +399,6 @@ export function TaskCard({
   currentUser,
   showCover,
   showBody,
-  showCreatedAt,
   onCreateLabel,
   onEdit,
   onUpdate,
@@ -425,7 +409,7 @@ export function TaskCard({
   onOpenConversation,
 }: TaskCardProps) {
   const { locale, text } = useTaskboardI18n();
-  const displayIdentifier = task.externalKey ?? task.identifier;
+  const displayIdentifier = taskDisplayIdentifier(task);
   const [propertyMenu, setPropertyMenu] = useState<"priority" | "labels" | "assignee" | null>(null);
   const [savingProperty, setSavingProperty] = useState<"priority" | "labels" | "dueDate" | "assignee" | null>(null);
   const creator: ActorIdentity = {
@@ -434,7 +418,11 @@ export function TaskCard({
     name: task.creatorName,
     avatarUrl: task.creatorAvatarUrl,
   };
-  const processingCard = task.status === "in_progress";
+  // Only treat an in-progress card as an AI "processing" card when an agent run is
+  // actually attached. Plain in-progress tasks keep their normal properties row
+  // instead of a misleading "Processing paused" line.
+  const processingCard = task.status === "in_progress"
+    && (presentation.processing.running || presentation.conversations.length > 0);
   const supportsConversation = task.status === "in_progress"
     || task.status === "in_review"
     || task.status === "blocked"
@@ -443,6 +431,9 @@ export function TaskCard({
   const showsConversation = supportsConversation && presentation.conversations.length > 0;
   const showsInlineParticipants = variant === "main"
     && task.participants.length > 0;
+  const hasToplineContent = presentation.unread
+    || task.status === "in_review"
+    || variant === "sidebar";
   const image = showCover ? firstTaskImage(task) : null;
   const body = useMemo(
     () => showBody ? taskBodyText(task.description) : "",
@@ -463,10 +454,7 @@ export function TaskCard({
   return (
     <article
       className={`task-card task-card-${variant} status-${task.status}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
-      style={{
-        viewTransitionName: task.status === "in_review" ? `review-task-${task.id}` : "none",
-        ...(dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : {}),
-      }}
+      style={dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : undefined}
       draggable={!isMoving}
       aria-labelledby={`task-${task.id}-title`}
       data-task-id={task.id}
@@ -491,10 +479,7 @@ export function TaskCard({
         onClick={() => onEdit(task)}
       />
 
-      <div className="card-topline">
-        <span className="card-reference">
-          <span className="task-identifier">ID: {displayIdentifier}</span>
-        </span>
+      <div className={`card-topline${hasToplineContent ? " has-card-actions" : ""}`}>
         {presentation.unread && <span className="task-unread-dot" aria-label={text("有未读更新", "Unread updates")} />}
         {task.status === "in_review" && onComplete && (
           <button
@@ -504,13 +489,7 @@ export function TaskCard({
             title={text("完成", "Complete")}
             onClick={(event) => {
               event.stopPropagation();
-              const card = event.currentTarget.closest<HTMLElement>(".task-card")!;
-              card.style.viewTransitionName = "completing-task";
-              const transition = document.startViewTransition(() => onComplete(task));
-              void transition.finished.then(
-                () => { card.style.viewTransitionName = `review-task-${task.id}`; },
-                () => { card.style.viewTransitionName = `review-task-${task.id}`; },
-              );
+              onComplete(task);
             }}
           >
             <img src={completeIcon} alt="" aria-hidden="true" />
@@ -528,11 +507,15 @@ export function TaskCard({
               onOpenChange={(open) => setPropertyMenu(open ? "assignee" : null)}
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
             />
+            <span>{createdDate(task.createdAt, locale, text)}</span>
           </span>
         )}
       </div>
 
       <h3 id={`task-${task.id}-title`}>{task.title}</h3>
+      <div className="card-reference task-card-secondary-reference">
+        <span className="task-identifier">ID: {displayIdentifier}</span>
+      </div>
 
       {body && <p className="task-card-description">{body}</p>}
 
@@ -607,14 +590,10 @@ export function TaskCard({
           <ProcessingProgress presentation={presentation} />
           <ProcessingStatusRow
             presentation={presentation}
+            now={now}
             onOpenConversation={onOpenConversation}
           />
         </>
-      )}
-      {showCreatedAt && (
-        <time className="task-card-created-at" dateTime={task.createdAt}>
-          {createdDate(task.createdAt, locale, text)}
-        </time>
       )}
     </article>
   );

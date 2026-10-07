@@ -1,4 +1,3 @@
-import { listenForOutsidePointerDown, listenForMenuViewportChange } from "../menuEvents";
 import {
   useEffect,
   useLayoutEffect,
@@ -22,6 +21,7 @@ import {
   matchesTaskFilters,
   matchesTaskSearch,
   taskFilterCount,
+  type TaskFilterKey,
   type TaskFilters,
 } from "../taskFilters";
 import {
@@ -35,9 +35,7 @@ import { LinearIcon } from "./LinearIcon";
 import { LabelIcon, PriorityIcon, StatusIcon } from "./SemanticIcons";
 import { TaskboardIcon } from "./TaskboardIcon";
 
-export type TaskSort = "default" | "name" | "priority";
-
-type SubmenuName = "statuses" | "priorities" | "labels" | "sort";
+type SubmenuName = "statuses" | "priorities" | "labels";
 
 interface TaskFilterMenuProps {
   tasks: Task[];
@@ -45,8 +43,6 @@ interface TaskFilterMenuProps {
   labels: string[];
   filters: TaskFilters;
   onChange: (filters: TaskFilters) => void;
-  sort: TaskSort;
-  onSortChange: (sort: TaskSort) => void;
 }
 
 interface FilterOption {
@@ -73,7 +69,7 @@ function joinSummary(values: string[], noun: string, language: TaskboardLanguage
   return language === "zh" ? `${values.length} 个${noun}` : `${values.length} ${noun}`;
 }
 
-export function TaskFilterMenu({ tasks, search, labels, filters, onChange, sort, onSortChange }: TaskFilterMenuProps) {
+export function TaskFilterMenu({ tasks, search, labels, filters, onChange }: TaskFilterMenuProps) {
   const { language, text } = useTaskboardI18n();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -108,7 +104,7 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange, sort,
     setSubmenu(name);
     setSubmenuQuery("");
     if (focus) {
-      requestAnimationFrame(() => submenuRef.current?.querySelector<HTMLElement>("input, button")?.focus());
+      requestAnimationFrame(() => submenuRef.current?.querySelector<HTMLInputElement>("input")?.focus());
     }
   }
 
@@ -117,33 +113,13 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange, sort,
     hoverTimerRef.current = window.setTimeout(() => openSubmenu(name), 160);
   }
 
-  const searchMatches = useMemo(() => {
-    if (!open) return [];
-    const contentFilters = { ...EMPTY_TASK_FILTERS, content: filters.content };
-    return tasks.filter((task) => matchesTaskSearch(task, search, language)
-      && matchesTaskFilters(task, contentFilters));
-  }, [filters.content, language, open, search, tasks]);
-
-  const counts = useMemo(() => {
-    const statuses = new Map<TaskStatus, number>();
-    const priorities = new Map<TaskPriority, number>();
-    const labelCounts = new Map<string, number>();
-    const filtersWithoutContent = { ...filters, content: "" };
-    for (const task of searchMatches) {
-      if (matchesTaskFilters(task, filtersWithoutContent, "statuses")) {
-        statuses.set(task.status, (statuses.get(task.status) ?? 0) + 1);
-      }
-      if (matchesTaskFilters(task, filtersWithoutContent, "priorities")) {
-        priorities.set(task.priority, (priorities.get(task.priority) ?? 0) + 1);
-      }
-      if (matchesTaskFilters(task, filtersWithoutContent, "labels")) {
-        for (const label of task.labels) {
-          labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
-        }
-      }
-    }
-    return { statuses, priorities, labels: labelCounts };
-  }, [filters, searchMatches]);
+  function countFor(key: TaskFilterKey, predicate: (task: Task) => boolean): number {
+    return tasks.filter(
+      (task) => matchesTaskSearch(task, search, language)
+        && matchesTaskFilters(task, filters, key)
+        && predicate(task),
+    ).length;
+  }
 
   function toggleStatus(status: TaskStatus) {
     const selected = new Set(filters.statuses);
@@ -171,44 +147,38 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange, sort,
     label: taskStatusLabel(language, status),
     category: text("状态", "Status"),
     keywords: status,
-    count: counts.statuses.get(status) ?? 0,
+    count: countFor("statuses", (task) => task.status === status),
     selected: filters.statuses.includes(status),
     icon: <span className="filter-status-icon"><StatusIcon status={status} color="currentColor" /></span>,
     toggle: () => toggleStatus(status),
-  })), [counts, filters, language, text]);
+  })), [filters, language, search, tasks, text]);
 
   const priorityOptions = useMemo<FilterOption[]>(() => TASK_PRIORITIES.map((priority) => ({
     id: `priority-${priority}`,
     label: taskPriorityLabel(language, priority),
     category: text("优先级", "Priority"),
     keywords: priority,
-    count: counts.priorities.get(priority) ?? 0,
+    count: countFor("priorities", (task) => task.priority === priority),
     selected: filters.priorities.includes(priority),
     icon: <PriorityIcon priority={priority} />,
     toggle: () => togglePriority(priority),
-  })), [counts, filters, language, text]);
+  })), [filters, language, search, tasks, text]);
 
   const labelOptions = useMemo<FilterOption[]>(() => labels.map((label) => ({
     id: `label-${label}`,
     label: labelDisplayName(label, language),
     category: text("标签", "Label"),
-    count: counts.labels.get(label) ?? 0,
+    count: countFor("labels", (task) => task.labels.includes(label)),
     selected: filters.labels.includes(label),
     icon: <LabelGlyph label={label} />,
     toggle: () => toggleLabel(label),
-  })), [counts, filters, labels, language, text]);
+  })), [filters, labels, language, search, tasks, text]);
 
   const optionsBySubmenu: Partial<Record<SubmenuName, FilterOption[]>> = {
     statuses: statusOptions,
     priorities: priorityOptions,
     labels: labelOptions,
   };
-
-  const sortOptions: { value: TaskSort; label: string }[] = [
-    { value: "default", label: text("默认排序", "Default order") },
-    { value: "name", label: text("名称排序", "Name order") },
-    { value: "priority", label: text("优先级排序", "Priority order") },
-  ];
 
   const categories = [
     {
@@ -243,13 +213,6 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange, sort,
         text("标签", "labels"),
         language,
       ),
-    },
-    {
-      id: "sort" as const,
-      label: text("排序", "Sort"),
-      keywords: "sort order name priority 默认 名称 优先级",
-      icon: <LinearIcon name="displayOptions" />,
-      summary: sortOptions.find((option) => option.value === sort)?.label ?? null,
     },
   ];
 
@@ -316,12 +279,25 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange, sort,
     if (!open) return;
     requestAnimationFrame(() => menuRef.current?.querySelector<HTMLInputElement>(".task-filter-search input")?.focus());
 
-    const stopOutside = listenForOutsidePointerDown([menuRef, triggerRef], closeMenu);
-    const stopViewport = listenForMenuViewportChange(menuRef, closeMenu);
+    function closeFromOutside(event: PointerEvent) {
+      if (!menuRef.current?.contains(event.target as Node) && !triggerRef.current?.contains(event.target as Node)) {
+        closeMenu();
+      }
+    }
+    function closeFromViewportChange(event: Event) {
+      if (event.type === "scroll" && menuRef.current?.contains(event.target as Node)) return;
+      closeMenu();
+    }
 
+    document.addEventListener("pointerdown", closeFromOutside);
+    window.addEventListener("blur", closeFromViewportChange);
+    window.addEventListener("resize", closeFromViewportChange);
+    window.addEventListener("scroll", closeFromViewportChange, true);
     return () => {
-      stopOutside();
-      stopViewport();
+      document.removeEventListener("pointerdown", closeFromOutside);
+      window.removeEventListener("blur", closeFromViewportChange);
+      window.removeEventListener("resize", closeFromViewportChange);
+      window.removeEventListener("scroll", closeFromViewportChange, true);
     };
   }, [open]);
 
@@ -417,26 +393,6 @@ export function TaskFilterMenu({ tasks, search, labels, filters, onChange, sort,
   }
 
   function renderValueSubmenu(name: SubmenuName) {
-    if (name === "sort") {
-      return (
-        <div className="task-filter-scroll" role="menu">
-          {sortOptions.map((option) => (
-            <button
-              key={option.value}
-              type="button"
-              role="menuitemradio"
-              aria-checked={sort === option.value}
-              className={`task-filter-item filter-value-item${sort === option.value ? " is-selected" : ""}`}
-              data-filter-level="submenu"
-              onClick={() => { onSortChange(option.value); closeMenu(); }}
-            >
-              <span className="task-filter-item-label">{option.label}</span>
-              <span className="task-filter-item-check">{sort === option.value && <LinearIcon name="check" />}</span>
-            </button>
-          ))}
-        </div>
-      );
-    }
     const options = optionsBySubmenu[name] ?? [];
     const needle = submenuQuery.trim().toLowerCase();
     const visible = options.filter((option) => `${option.label} ${option.keywords ?? ""}`.toLowerCase().includes(needle));
