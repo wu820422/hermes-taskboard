@@ -27,7 +27,7 @@
     "dev:server": "node --watch server/index.mjs --dev",
     "dev:web": "vite --config web/vite.config.ts",
     "dev:cloud": "npm run build:web && wrangler dev --local",
-  "build": "vite build --config web/vite.config.ts && wrangler deploy --dry-run --outdir dist/server --config wrangler.jsonc && node scripts/prepare-sites-client.mjs && node scripts/codex-injector.mjs --refresh-if-running",
+    "build": "npm run build:web && wrangler deploy --dry-run --outdir dist/server --config wrangler.v2.jsonc",
     "build:web": "vite build --config web/vite.config.ts",
     "typecheck": "tsc -p web/tsconfig.json --noEmit",
     "start": "node server/index.mjs",
