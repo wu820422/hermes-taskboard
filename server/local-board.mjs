@@ -1,3 +1,4 @@
+import { agentProfile, parseExecutionIdentity } from "../shared/execution-identity.mjs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import { toolDefs } from "../cloud/src/oauth-mcp.mjs";
@@ -79,6 +80,16 @@ function jsonResult(status, body) {
 async function dispatchTool(board, name, args, actor) {
   const { store: database, engine, blobs } = board;
   if (!database) throw new Error("Local task store is not configured");
+  if (name === "whoami") return { actor, environment: "local", model: null, modelVerification: "not_provided" };
+  if (name === "register_agent") {
+    const profile = agentProfile(actor, args.executionIdentity, "local");
+    const comment = database.createComment(args.id, { body: profile.markdown, executionIdentity: profile.executionIdentity, actor });
+    const bytes = Buffer.from(profile.markdown, "utf8");
+    const id = randomUUID();
+    await blobs.put(id, bytes);
+    const attachment = database.createAttachment(args.id, { id, kind: "attachment", filename: profile.filename, contentType: "text/markdown; charset=utf-8", size: bytes.byteLength });
+    return { ...profile, comment, attachment };
+  }
   if (name === "search") {
     const query = String(args.query ?? "").toLowerCase();
     const tasks = database.listTasks({ archived: "all" }).filter((task) => (
@@ -118,7 +129,7 @@ async function dispatchTool(board, name, args, actor) {
   if (name === "archive_issue") return { task: database.archiveTask(args.id, args.version, null, undefined, actor) };
   if (name === "restore_issue") return { task: database.restoreTask(args.id, args.version, null, undefined, actor) };
   if (name === "list_comments") return { comments: database.listComments(args.id) };
-  if (name === "add_comment") return { comment: database.createComment(args.id, { body: args.body, actor }) };
+  if (name === "add_comment") return { comment: database.createComment(args.id, { body: args.body, executionIdentity: parseExecutionIdentity(args.executionIdentity), actor }) };
   if (name === "update_comment") return { comment: database.updateComment(args.id, args.version, args.body, null, undefined) };
   if (name === "delete_comment") {
     database.deleteComment(args.id, args.version);
@@ -161,7 +172,7 @@ async function dispatchTool(board, name, args, actor) {
 }
 
 const WRITE_TOOLS = new Set([
-  "create_issue", "update_issue", "add_comment", "move_issue", "archive_issue", "restore_issue",
+  "register_agent", "create_issue", "update_issue", "add_comment", "move_issue", "archive_issue", "restore_issue",
   "update_comment", "delete_comment", "add_attachment", "delete_attachment", "set_project_readme",
   "add_relation", "remove_relation", "resolve_conflict",
 ]);

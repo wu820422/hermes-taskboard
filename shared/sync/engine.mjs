@@ -179,7 +179,7 @@ async function loadRows(db, entityType) {
     case "comment":
       return db.all(`
         SELECT
-          id, task_id, body, author_type, author_id, author_name, author_avatar_url, created_at
+          id, task_id, body, author_type, author_id, author_name, author_avatar_url, execution_identity, created_at
         FROM comments
       `);
     case "attachment":
@@ -216,7 +216,7 @@ const FIELDS = {
     "external_source", "external_origin", "external_id", "external_key", "external_url",
     "development_context_type", "development_branch", "created_at",
   ],
-  comment: ["task_id", "body", "author_type", "author_id", "author_name", "author_avatar_url", "created_at"],
+  comment: ["task_id", "body", "author_type", "author_id", "author_name", "author_avatar_url", "execution_identity", "created_at"],
   attachment: ["task_id", "comment_id", "kind", "filename", "content_type", "size", "created_at", "content_sha256"],
   project_readme_attachment: ["project_id", "filename", "content_type", "size", "created_at", "content_sha256"],
   relation: ["relation_type", "source_task_id", "target_task_id", "origin", "created_at"],
@@ -1007,9 +1007,9 @@ export function createSyncEngine(db, options = {}) {
       if (!existing) {
         await db.run(`
           INSERT INTO comments (
-            id, task_id, body, author_type, author_id, author_name, author_avatar_url,
+            id, task_id, body, author_type, author_id, author_name, author_avatar_url, execution_identity,
             version, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         `, [
           entityId,
           fields.task_id,
@@ -1018,6 +1018,7 @@ export function createSyncEngine(db, options = {}) {
           fields.author_id ?? "sync",
           fields.author_name ?? "Sync",
           fields.author_avatar_url ?? null,
+          fields.execution_identity ?? null,
           fields.created_at ?? timestamp,
           timestamp,
         ]);
@@ -1029,6 +1030,7 @@ export function createSyncEngine(db, options = {}) {
           author_id: fields.author_id,
           author_name: fields.author_name,
           author_avatar_url: fields.author_avatar_url,
+          execution_identity: fields.execution_identity,
           updated_at: timestamp,
         });
         await db.run("UPDATE comments SET version = version + 1 WHERE id = ?", [entityId]);

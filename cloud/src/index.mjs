@@ -1,3 +1,5 @@
+import { executionFromRow, executionsFromComments } from "../../shared/execution-identity.mjs";
+import { parseExecutionIdentity } from "../../shared/execution-identity.mjs";
 import { DurableObject } from "cloudflare:workers";
 
 import { DEFAULT_LABEL_NAMES } from "../../shared/domain.mjs";
@@ -872,6 +874,7 @@ function attachTaskActivity(task, comments, activities, previewImage = null) {
   }
   task.conversationRefs = conversationRefs;
   task.participants = participants;
+  task.executions = executionsFromComments(orderedComments);
   task.previewImage = previewImage;
   task.activityKey = JSON.stringify({
     version: 1,
@@ -1002,6 +1005,7 @@ function commentFromRow(row, attachments = []) {
     authorId: row.author_id,
     authorName: row.author_name,
     authorAvatarUrl: row.author_avatar_url,
+    executionIdentity: executionFromRow(row),
     attachments,
     version: row.version,
     createdAt: row.created_at,
@@ -1188,7 +1192,7 @@ async function hydrateTask(env, row, activityComments = null, activityChanges = 
       thread_id, thread_codex_project_id, thread_codex_project_kind,
       thread_codex_host_id, thread_workspace_path,
       author_type, author_id, author_name,
-      author_avatar_url, version, updated_at
+      author_avatar_url, execution_identity, created_at, version, updated_at
     FROM comments
     WHERE task_id = ?
     ORDER BY id
@@ -1293,7 +1297,7 @@ async function taskActivityComments(env, taskIds) {
         thread_id, thread_codex_project_id, thread_codex_project_kind,
         thread_codex_host_id, thread_workspace_path,
         author_type, author_id, author_name,
-        author_avatar_url, version, updated_at
+        author_avatar_url, execution_identity, created_at, version, updated_at
       FROM comments
       WHERE task_id IN (${placeholders})
       ORDER BY task_id, id
@@ -1513,8 +1517,12 @@ function parseRelationMutation(body) {
 
 function parseCommentCreate(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["body", "threadId", "threadBinding"]));
+  assertAllowedKeys(body, new Set(["body", "threadId", "threadBinding", "executionIdentity"]));
+  let executionIdentity;
+  try { executionIdentity = parseExecutionIdentity(body.executionIdentity); }
+  catch (error) { throw new ApiError(400, "INVALID_EXECUTION_IDENTITY", error.message); }
   return {
+    executionIdentity,
     body: stringField(body.body ?? "", "body", { maxLength: 100_000 }),
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
@@ -2970,8 +2978,8 @@ async function createComment(env, taskId, input, actor) {
     INSERT INTO comments (
       id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
       thread_codex_host_id, thread_workspace_path, author_type, author_id, author_name,
-      author_avatar_url, version, created_at, updated_at, change_revision
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?,
+      author_avatar_url, execution_identity, version, created_at, updated_at, change_revision
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?,
       (SELECT revision + 1 FROM global_revision WHERE singleton = 1))
   `).bind(
     id,
@@ -2982,6 +2990,7 @@ async function createComment(env, taskId, input, actor) {
     actor.id,
     actor.name,
     actor.avatarUrl,
+    input.executionIdentity ? JSON.stringify(input.executionIdentity) : null,
     timestamp,
     timestamp,
   ).run();

@@ -1252,6 +1252,23 @@ export function TaskDetail({
               )}
             />
 
+            <section className="task-executions" aria-label="AI 參與者">
+              <h2>AI 參與者</h2>
+              <p>同一任務可由多個 AI 並行。下列狀態為最近一次工作回報。</p>
+              {(currentTask.executions ?? []).length === 0 && <p>尚無執行回報；歷史作者未提供模型與執行來源。</p>}
+              {(currentTask.executions ?? []).map((run) => (
+                <article key={`${run.actorId}:${run.agent}:${run.environment}:${run.sessionId}`}>
+                  <strong>{run.agent}</strong>
+                  <span>{run.model || "模型未提供"}</span>
+                  <span>{run.environment === "local" ? "本機" : run.environment === "cloud" ? "雲端" : "來源未提供"}</span>
+                  <span>{{ working: "執行中", waiting: "等待中", completed: "已完成工作", blocked: "受阻" }[run.state]}</span>
+                  <p>{run.scope || "工作範圍未提供"}</p>
+                  <small title={run.sessionId}>對話／執行：{run.sessionId}</small>
+                  <a href={`#comment-${run.commentId}`}>最近回報 · {relativeTime(run.observedAt, locale)}</a>
+                </article>
+              ))}
+            </section>
+
             <section className="activity-section" aria-labelledby="activity-heading">
               <header className="activity-heading">
                 <h2 id="activity-heading">{text("活动", "Activity")}</h2>
@@ -1360,7 +1377,8 @@ export function TaskDetail({
                             avatarUrl: comment.authorAvatarUrl,
                           }}
                         />
-                        <strong>{comment.authorName}</strong>
+                        <strong>{comment.executionIdentity?.agent || comment.authorName}</strong>
+                        {comment.authorType === "agent" && <span className="execution-badge">{comment.executionIdentity?.model || "模型未提供"} · {comment.executionIdentity?.environment === "local" ? "本機" : comment.executionIdentity?.environment === "cloud" ? "雲端" : "來源未提供"}</span>}
                         <span className="actor-id">@{comment.authorId}</span>
                         <time title={exactTime(comment.createdAt, locale)}>{relativeTime(comment.createdAt, locale)}</time>
                         {comment.version > 1 && (
